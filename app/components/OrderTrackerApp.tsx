@@ -2,7 +2,7 @@
 
 /* eslint-disable @next/next/no-img-element */
 
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { PreviewNav } from "./PreviewNav";
 import { normalizeOrder } from "./SellerDashboardApp";
@@ -16,14 +16,15 @@ function getProgress(order: Order) {
     ];
   }
   const confirmed = ["confirmed", "completed"].includes(order.commercialStatus);
-  const preparing = ["preparing", "ready", "ready_for_pickup", "ready_for_courier", "in_transit", "delivered", "fulfilled"].includes(order.productionStatus ?? "") || order.commercialStatus === "completed";
-  const ready = ["ready", "ready_for_pickup", "ready_for_courier", "in_transit", "delivered", "fulfilled"].includes(order.productionStatus ?? "") || order.commercialStatus === "completed";
+  const preparing = ["preparing", "ready", "ready_for_pickup", "ready_for_courier", "out_for_delivery", "in_transit", "delivered", "fulfilled"].includes(order.productionStatus ?? "") || order.commercialStatus === "completed";
+  const ready = ["ready", "ready_for_pickup", "ready_for_courier", "out_for_delivery", "in_transit", "delivered", "fulfilled"].includes(order.productionStatus ?? "") || order.commercialStatus === "completed";
+  const inTransit = ["out_for_delivery", "in_transit"].includes(order.productionStatus ?? "");
   const complete = order.commercialStatus === "completed" || ["delivered", "fulfilled", "collected"].includes(order.fulfilmentStatus ?? "");
   return [
     { label: "Request placed", detail: "Capacity reserved and payment authorised", done: true, active: !confirmed },
     { label: "Florist confirmed", detail: "Payment captured when the seller accepts", done: confirmed, active: confirmed && !preparing },
     { label: "Being arranged", detail: "Your florist is preparing the flowers", done: preparing, active: preparing && !ready },
-    { label: order.fulfilmentMethod === "pickup" ? "Ready for pickup" : "Ready for courier", detail: order.fulfilmentWindow, done: ready, active: ready && !complete },
+    { label: order.fulfilmentMethod === "pickup" ? "Ready for pickup" : inTransit ? "Out for delivery" : "Ready for courier", detail: order.fulfilmentWindow, done: ready, active: ready && !complete },
     { label: order.fulfilmentMethod === "pickup" ? "Collected" : "Delivered", detail: "Order completed", done: complete, active: complete },
   ];
 }
@@ -36,8 +37,13 @@ export function OrderTrackerApp({ orderId }: { orderId: string }) {
   const [error, setError] = useState("");
   const [sending, setSending] = useState(false);
   const [notice, setNotice] = useState("");
+  const [refreshNotice, setRefreshNotice] = useState("");
+  const orderRequest = useRef(0);
+  const hasLoadedOrder = useRef(false);
+  const messageRequestKey = useRef("");
 
   async function loadOrder(silent = false) {
+    const requestId = ++orderRequest.current;
     if (!silent) setIsLoading(true);
     try {
       const response = await fetch(`/api/v1/orders/${orderId}`, { cache: "no-store" });
@@ -54,21 +60,35 @@ export function OrderTrackerApp({ orderId }: { orderId: string }) {
       }
       const raw = (data.order ?? data) as Record<string, unknown>;
       const normalized = normalizeOrder({ ...raw, events: data.events, messages: data.messages });
+      if (requestId !== orderRequest.current) return;
+      hasLoadedOrder.current = true;
       setOrder(normalized);
       setEvents(normalized.events ?? []);
       setMessages(normalized.messages ?? []);
       setError("");
+      setRefreshNotice("");
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "This order could not be found.");
+      if (requestId !== orderRequest.current) return;
+      const message = caught instanceof Error ? caught.message : "This order could not be found.";
+      if (silent && hasLoadedOrder.current) {
+        setRefreshNotice(`${message} Showing the last confirmed order update.`);
+      } else {
+        setError(message);
+      }
     } finally {
-      setIsLoading(false);
+      // A silent poll can supersede a slow initial request. Whichever current
+      // request settles must release the initial loading screen.
+      if (requestId === orderRequest.current) setIsLoading(false);
     }
   }
 
   useEffect(() => {
+    orderRequest.current += 1;
+    hasLoadedOrder.current = false;
     const initialLoad = window.setTimeout(() => void loadOrder(), 0);
     const timer = window.setInterval(() => void loadOrder(true), 12000);
     return () => {
+      orderRequest.current += 1;
       window.clearTimeout(initialLoad);
       window.clearInterval(timer);
     };
@@ -79,14 +99,16 @@ export function OrderTrackerApp({ orderId }: { orderId: string }) {
 
   async function sendMessage(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const form = new FormData(event.currentTarget);
+    const formElement = event.currentTarget;
+    const form = new FormData(formElement);
     const body = String(form.get("body") ?? "").trim();
     if (!body) return;
+    if (!messageRequestKey.current) messageRequestKey.current = crypto.randomUUID();
     setSending(true);
     try {
       const response = await fetch(`/api/v1/orders/${orderId}/messages`, {
         method: "POST",
-        headers: { "content-type": "application/json", "Idempotency-Key": crypto.randomUUID() },
+        headers: { "content-type": "application/json", "Idempotency-Key": messageRequestKey.current },
         body: JSON.stringify({ body, senderRole: "buyer", senderName: order?.buyerName ?? "Buyer" }),
       });
       const data = (await response.json()) as Record<string, unknown>;
@@ -98,9 +120,11 @@ export function OrderTrackerApp({ orderId }: { orderId: string }) {
             : apiError && typeof apiError === "object"
               ? String((apiError as Record<string, unknown>).message ?? "Message not sent.")
               : "Message not sent.";
+        if (response.status < 500) messageRequestKey.current = "";
         throw new Error(message);
       }
-      event.currentTarget.reset();
+      formElement.reset();
+      messageRequestKey.current = "";
       setNotice("Message sent in this order thread.");
       await loadOrder(true);
     } catch (caught) {
@@ -144,6 +168,7 @@ export function OrderTrackerApp({ orderId }: { orderId: string }) {
               <div><span>Current state</span><strong>{humanizeStatus(order.commercialStatus)}</strong><small>{humanizeStatus(order.paymentStatus)} payment</small></div>
             </div>
           </section>
+          {refreshNotice && <p className="dashboard-feedback" role="status">{refreshNotice}</p>}
 
           {order.commercialStatus === "awaiting_seller" && (
             <aside className="demo-handoff">

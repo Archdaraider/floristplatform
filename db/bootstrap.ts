@@ -161,7 +161,8 @@ CREATE TABLE IF NOT EXISTS order_events (
   created_at text DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
 CREATE INDEX IF NOT EXISTS order_events_order_created_idx ON order_events (order_id, created_at);
-CREATE UNIQUE INDEX IF NOT EXISTS order_events_idempotency_key_unique ON order_events (idempotency_key);
+DROP INDEX IF EXISTS order_events_idempotency_key_unique;
+CREATE UNIQUE INDEX IF NOT EXISTS order_events_order_idempotency_key_unique ON order_events (order_id, idempotency_key);
 
 CREATE TABLE IF NOT EXISTS messages (
   id text PRIMARY KEY NOT NULL,
@@ -176,7 +177,8 @@ CREATE TABLE IF NOT EXISTS messages (
   CONSTRAINT messages_body_not_empty CHECK (length(body) > 0)
 );
 CREATE INDEX IF NOT EXISTS messages_order_created_idx ON messages (order_id, created_at);
-CREATE UNIQUE INDEX IF NOT EXISTS messages_idempotency_key_unique ON messages (idempotency_key);
+DROP INDEX IF EXISTS messages_idempotency_key_unique;
+CREATE UNIQUE INDEX IF NOT EXISTS messages_order_idempotency_key_unique ON messages (order_id, idempotency_key);
 `;
 
 type SeedValue = string | number | null;

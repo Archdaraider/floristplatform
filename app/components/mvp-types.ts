@@ -23,6 +23,7 @@ export type Product = {
   pickupLabel?: string | null;
   capacityRemaining: number;
   availableWindows: string[];
+  confirmationMinutes?: number;
   rating?: number;
   reviewCount?: number;
   stemCount?: string;
@@ -78,6 +79,7 @@ export type Order = {
   fulfilmentWindow: string;
   postcode?: string;
   addressLine?: string;
+  deliveryInstructions?: string;
   publicPickupArea?: string;
   privatePickupInstructions?: string | null;
   cardMessage?: string;

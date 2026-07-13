@@ -42,6 +42,8 @@ export type OrderAction =
 
 export type AvailabilityReason =
   | "SELLER_NOT_ACTIVE"
+  | "SELLER_NOT_VERIFIED"
+  | "SELLER_PAYMENT_NOT_READY"
   | "SELLER_PAUSED"
   | "PRODUCT_NOT_PUBLISHED"
   | "METHOD_DISABLED"

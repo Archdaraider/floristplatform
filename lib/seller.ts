@@ -1,5 +1,6 @@
 import { ensureDemoDatabase } from "../db/bootstrap";
 import { ApiError } from "./api";
+import { reconcileExpiredOrders } from "./order-expiry";
 import { DEMO_MODE, MARKET_CURRENCY, MARKET_TIMEZONE, type FulfilmentMethod, type ProductStatus, type SellerSummary } from "./types";
 import { nowIso, localDateFromNow } from "./time";
 import { sellerOrders } from "./orders";
@@ -106,6 +107,7 @@ async function sellerRow(id = MAIN_DEMO_SELLER_ID) {
 }
 
 export async function sellerDashboard() {
+  await reconcileExpiredOrders();
   const database = await ensureDemoDatabase();
   const [rawSeller, orders, productResult, capacityResult, unreadResult] = await Promise.all([
     sellerRow(),
@@ -199,13 +201,63 @@ export async function sellerDashboard() {
   };
 }
 
-export async function updateSellerSettings(input: {
-  acceptingNewOrders?: boolean;
-  paused?: boolean;
-  pausedUntil?: string | null;
-}) {
-  if (!input || typeof input !== "object") {
+export async function updateSellerSettings(rawInput: unknown) {
+  if (!rawInput || typeof rawInput !== "object" || Array.isArray(rawInput)) {
     throw new ApiError("INVALID_SETTINGS", "Seller settings must be a JSON object.", 422);
+  }
+  const input = rawInput as Record<string, unknown>;
+  if (
+    input.acceptingNewOrders !== undefined &&
+    typeof input.acceptingNewOrders !== "boolean"
+  ) {
+    throw new ApiError(
+      "INVALID_SETTINGS",
+      "Accepting-new-orders must be true or false.",
+      422,
+      false,
+      { acceptingNewOrders: "Use true or false." }
+    );
+  }
+  if (input.paused !== undefined && typeof input.paused !== "boolean") {
+    throw new ApiError(
+      "INVALID_SETTINGS",
+      "Paused must be true or false.",
+      422,
+      false,
+      { paused: "Use true or false." }
+    );
+  }
+  if (
+    input.pausedUntil !== undefined &&
+    input.pausedUntil !== null &&
+    typeof input.pausedUntil !== "string"
+  ) {
+    throw new ApiError(
+      "INVALID_SETTINGS",
+      "Pause-until must be an ISO date-time or null.",
+      422,
+      false,
+      { pausedUntil: "Use an ISO date-time or null." }
+    );
+  }
+  if (typeof input.pausedUntil === "string") {
+    const pausedUntil = input.pausedUntil.trim();
+    if (
+      pausedUntil.length > 40 ||
+      (pausedUntil &&
+        (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(
+          pausedUntil
+        ) ||
+          !Number.isFinite(Date.parse(pausedUntil))))
+    ) {
+      throw new ApiError(
+        "INVALID_SETTINGS",
+        "Pause-until must be a valid ISO date-time or null.",
+        422,
+        false,
+        { pausedUntil: "Use a valid ISO date-time or null." }
+      );
+    }
   }
   const database = await ensureDemoDatabase();
   const current = await sellerRow();
@@ -215,8 +267,21 @@ export async function updateSellerSettings(input: {
       : typeof input.paused === "boolean"
         ? !input.paused
         : Boolean(current.accepting_new_orders);
-  const pausedUntil = accepting ? null : input.pausedUntil?.trim() || null;
-  const status = accepting ? "active" : "paused";
+  if (accepting && ["restricted", "suspended"].includes(current.status)) {
+    throw new ApiError(
+      "SELLER_RESTRICTED",
+      "A restricted seller cannot reopen marketplace intake.",
+      409,
+      false
+    );
+  }
+  const pausedUntil =
+    accepting || typeof input.pausedUntil !== "string" ? null : input.pausedUntil.trim() || null;
+  const status = ["active", "paused"].includes(current.status)
+    ? accepting
+      ? "active"
+      : "paused"
+    : current.status;
   const now = nowIso();
   await database
     .prepare(

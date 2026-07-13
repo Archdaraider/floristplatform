@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en-SG">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f5efe5" />
+    <title>Petalfolk is offline</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: #29241f;
+        background: #f5efe5;
+      }
+      * { box-sizing: border-box; }
+      body {
+        min-height: 100vh;
+        min-height: 100dvh;
+        margin: 0;
+        display: grid;
+        place-items: center;
+        padding: 24px;
+      }
+      main {
+        width: min(100%, 560px);
+        padding: clamp(28px, 7vw, 56px);
+        border: 1px solid #d8cfc2;
+        background: #fffaf3;
+      }
+      .wordmark { margin: 0 0 48px; font: 700 24px/1 Georgia, serif; }
+      .wordmark span { color: #a94f42; }
+      .eyebrow {
+        margin: 0 0 12px;
+        color: #796f65;
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+      h1 { margin: 0; font: 400 clamp(36px, 8vw, 58px)/0.98 Georgia, serif; }
+      p { margin: 22px 0 0; color: #62594f; font-size: 17px; line-height: 1.6; }
+      a {
+        min-height: 44px;
+        margin-top: 30px;
+        display: inline-flex;
+        align-items: center;
+        padding: 0 20px;
+        color: #fffaf3;
+        background: #29241f;
+        font-weight: 700;
+        text-decoration: none;
+      }
+      a:focus-visible { outline: 3px solid #a94f42; outline-offset: 4px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <p class="wordmark">petalfolk<span>.</span></p>
+      <p class="eyebrow">Connection paused</p>
+      <h1>The florists are still here.</h1>
+      <p>Reconnect to refresh live availability, place an order, or open a private order workspace. Operational and order data is never served from an offline cache.</p>
+      <a href="/">Try again</a>
+    </main>
+  </body>
+</html>

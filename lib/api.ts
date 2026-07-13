@@ -63,5 +63,13 @@ export async function jsonBody<T>(request: Request): Promise<T> {
 
 export function idempotencyKey(request: Request, fallbackPrefix: string): string {
   const supplied = request.headers.get("idempotency-key")?.trim();
+  if (supplied && supplied.length > 200) {
+    throw new ApiError(
+      "INVALID_IDEMPOTENCY_KEY",
+      "Idempotency-Key must be 200 characters or fewer.",
+      400,
+      false
+    );
+  }
   return supplied || `${fallbackPrefix}:${crypto.randomUUID()}`;
 }

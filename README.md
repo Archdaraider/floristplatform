@@ -42,7 +42,8 @@ The application is also configured as an installable PWA with a manifest, servic
 7. Continue through preparation, ready, courier, delivered, and fulfilment actions.
 8. Return to the buyer order URL to see the updated simplified status and append-only timeline.
 9. Use the order thread to send a labelled buyer message.
-10. Open `/admin` to see seller review, exception, financial-boundary, and audit-timeline projections.
+10. In the seller studio, verify the destination, delivery instructions, and shared conversation before fulfilment.
+11. Open `/admin` to see seller review, exception, financial-boundary, and audit-timeline projections.
 
 The black preview bar at the top of every main screen switches between consumer, seller, and operations pathways.
 
@@ -57,9 +58,11 @@ The black preview bar at the top of every main screen switches between consumer,
 - Bookable-only results with real zero-result handling
 - Product fulfilment, lead-time, representative-photo, substitution, and seller-responsibility context
 - One-florist-per-order basket guardrail
-- Buyer and recipient details collected separately
+- Submitted availability plan stays attached to its results, basket, total, and checkout even while draft search controls change
+- Buyer and recipient details collected separately, with optional delivery instructions supplied by the buyer
 - Final SGD price including seller-managed delivery
 - Idempotent order creation and immutable product, policy, fee, and price snapshots
+- Stable checkout retry key, canonical server-owned fulfilment window, and field-level recovery errors
 - Manual acceptance flow: simulated authorise at checkout, capture on seller acceptance, void on decline
 - Buyer-safe tracking projection, labelled order messages, and append-only activity
 - Home-seller public area without a private address payload
@@ -72,6 +75,7 @@ The black preview bar at the top of every main screen switches between consumer,
 - Accept, decline, prepare, ready, courier, deliver, and fulfil actions
 - Idempotent seller transitions and simulated payment/payout side effects
 - Order detail with separate buyer, recipient, gift-message, and fulfilment context
+- Authorised delivery destination, delivery instructions, and a two-way order conversation in the seller workspace
 - Catalogue publish/pause controls that do not mutate historical order snapshots
 - Seller intake pause/resume that preserves confirmed obligations
 - Seven-day capacity projection and represented fulfilment configuration
@@ -89,12 +93,14 @@ The black preview bar at the top of every main screen switches between consumer,
 
 - Responsive React/TypeScript UI for mobile, tablet, and desktop
 - Warm editorial design system using Geist, Geist Mono, and Instrument Serif
-- Keyboard focus states, skip navigation, semantic landmarks, 44px touch targets, reduced-motion support, loading/empty/error states, and non-colour status labels
+- Keyboard focus states, trapped/restored modal focus, Escape handling, background inerting, scroll lock, skip navigation, semantic landmarks, 44px touch targets, reduced-motion support, loading/empty/error states, and non-colour status labels
 - Versioned `/api/v1` routes
 - D1/SQLite persistence with Drizzle schema and generated migration
-- Capacity constraints, unique idempotency keys, and append-only order events/messages
+- Capacity constraints, order-scoped command idempotency, payload-conflict detection, and append-only order events/messages
+- Strict runtime validation for untrusted JSON, deterministic delivery-zone selection, and canonical window/fee snapshots
+- Idempotent lazy expiry reconciliation that voids timed-out demo authorisations and releases capacity
 - Singapore timezone and SGD money conventions
-- PWA manifest, icons, service worker, and route shortcuts
+- PWA manifest, icons, public static-asset caching, a branded offline fallback, and route shortcuts; order, seller, admin, API, private, and `no-store` responses are excluded from runtime caching
 - Branded metadata, policy-note pages, favicon, and custom not-found page
 
 ## Architecture
@@ -123,6 +129,14 @@ The current implementation uses the Sites-compatible vinext runtime (React 19, N
 
 The D1 binding is declared logically as `DB` in `.openai/hosting.json`. Local development keeps data in project-local Wrangler state. The seed routine is idempotent, so restarting the development server preserves demo changes rather than duplicating records.
 
+## Three deep-dive improvements
+
+The July 2026 regression pass consolidated the fixes into three project-level improvements:
+
+1. **Server trust and transaction integrity.** All order/message/action payloads are checked at runtime, idempotent replays are scoped and payload-matched, delivery zones and windows are server-derived, pickup snapshots cannot carry a delivery zone, and expired reservations release capacity with one event/message. The PWA cache now excludes protected and dynamic routes.
+2. **One verified buyer plan.** Catalogue results, product details, basket pricing, and checkout use the exact submitted date/method/postcode plan. Editing draft controls cannot relabel stale products, filter reset re-runs availability, overlapping requests cannot overwrite the newest result, and retry keys survive ambiguous network failures.
+3. **Reliable, accessible live operations.** Seller selection cannot act on a previously selected order, delivery data and messages are available at handoff, buyer tracking remains monotonic through courier states and survives transient polling failure, operational empty states never invent records, and every modal/drawer traps focus, closes with Escape, restores focus, and exposes inline checkout errors.
+
 ## Implemented API surface
 
 | Method | Path | Purpose |
@@ -146,7 +160,10 @@ The machine-readable contract is in [`docs/openapi.yaml`](docs/openapi.yaml). Ev
 npm run typecheck
 npm run lint
 npm test
+npm audit --omit=dev
 ```
+
+The production dependency audit is clean. The full development-tree audit still reports four moderate advisories through the current `drizzle-kit` → legacy `esbuild` toolchain; `drizzle-kit` 0.31.10 is already the latest release, and npm's offered fix is an incompatible downgrade. Keep the local development server bound to trusted interfaces until that upstream chain is replaced.
 
 With the development server running, exercise the complete persisted order lifecycle:
 
@@ -165,6 +182,8 @@ The smoke test proves:
 - guarded delivery and pickup states reach completion;
 - material actions create an append-only event trail; and
 - order-scoped messaging persists.
+
+`npm test` also runs eight rendered-route and API guardrail checks, including malformed JSON returning `422`, cross-order idempotency isolation, concurrent exact-retry serialization, changed-payload conflicts, tampered-window rejection, plan-snapshot source guards, keyboard-dialog guards, and private-route service-worker exclusions.
 
 Generate a migration after changing `db/schema.ts`:
 

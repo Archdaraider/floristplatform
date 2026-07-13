@@ -1,6 +1,7 @@
 import { ensureDemoDatabase } from "../db/bootstrap";
 import { allSellerReviewData } from "./seller";
 import { DEMO_MODE, MARKET_CURRENCY } from "./types";
+import { reconcileExpiredOrders } from "./order-expiry";
 import { addMinutesIso, nowIso } from "./time";
 
 interface MetricsRow {
@@ -37,6 +38,7 @@ interface RecentEventRow {
 }
 
 export async function adminDashboard() {
+  await reconcileExpiredOrders();
   const database = await ensureDemoDatabase();
   const now = nowIso();
   const [metrics, sellerReviews, exceptionResult, eventResult] = await Promise.all([
@@ -58,7 +60,7 @@ export async function adminDashboard() {
                 o.payment_status, o.accept_by, o.requested_date_local, o.updated_at
          FROM orders o JOIN sellers s ON s.id = o.seller_id
          WHERE (o.operational_status = 'awaiting_acceptance' AND o.accept_by <= ?)
-            OR (o.operational_status IN ('preparing', 'ready') AND o.requested_date_local <= date('now', '+1 day'))
+            OR (o.operational_status IN ('preparing', 'ready') AND o.requested_date_local <= date('now', '+8 hours', '+1 day'))
          ORDER BY o.accept_by ASC, o.updated_at ASC`
       )
       .bind(addMinutesIso(now, 30))

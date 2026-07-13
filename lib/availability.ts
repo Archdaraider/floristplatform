@@ -1,5 +1,6 @@
 import { ensureDemoDatabase } from "../db/bootstrap";
 import { ApiError } from "./api";
+import { reconcileExpiredOrders } from "./order-expiry";
 import {
   DEMO_MODE,
   MARKET_CURRENCY,
@@ -44,6 +45,7 @@ export interface MarketplaceRow {
   seller_type: "home" | "studio" | "store";
   seller_status: "pending_review" | "active" | "paused" | "restricted" | "suspended";
   verification_status: "pending" | "verified" | "needs_information";
+  psp_ready: number;
   accepting_new_orders: number;
   paused_until: string | null;
   public_story: string;
@@ -61,6 +63,7 @@ export interface MarketplaceRow {
   total_capacity: number | null;
   reserved_capacity: number | null;
   committed_capacity: number | null;
+  zone_id?: string | null;
   zone_name: string | null;
   postal_sectors_json: string | null;
   zone_fee_cents: number | null;
@@ -92,6 +95,7 @@ SELECT
   s.seller_type,
   s.status AS seller_status,
   s.verification_status,
+  s.psp_ready,
   s.accepting_new_orders,
   s.paused_until,
   s.public_story,
@@ -109,6 +113,7 @@ SELECT
   c.total_capacity,
   c.reserved_capacity,
   c.committed_capacity,
+  z.id AS zone_id,
   z.name AS zone_name,
   z.postal_sectors_json,
   z.fee_cents AS zone_fee_cents,
@@ -205,6 +210,42 @@ function postcodeSector(postcode?: string): string | undefined {
   return postcode.slice(0, 2);
 }
 
+function zoneSupportsContext(row: MarketplaceRow, context: CatalogContext) {
+  if (context.method === "pickup") return true;
+  const sector = postcodeSector(context.postcode);
+  const sectors = arrayJson(row.postal_sectors_json);
+  return Boolean(
+    sector && row.zone_name && (sectors.includes("*") || sectors.includes(sector))
+  );
+}
+
+function chooseMarketplaceRow(rows: MarketplaceRow[], context: CatalogContext) {
+  if (!rows.length) return null;
+  if (context.method === "pickup") {
+    return {
+      ...rows[0],
+      zone_id: null,
+      zone_name: null,
+      postal_sectors_json: null,
+      zone_fee_cents: null,
+      zone_window_label: null,
+    };
+  }
+
+  const matching = rows.filter((row) => zoneSupportsContext(row, context));
+  const candidates = matching.length ? matching : rows;
+  const compareText = (left: string, right: string) =>
+    left < right ? -1 : left > right ? 1 : 0;
+  return [...candidates].sort((left, right) => {
+    const feeDifference =
+      (left.zone_fee_cents ?? Number.MAX_SAFE_INTEGER) -
+      (right.zone_fee_cents ?? Number.MAX_SAFE_INTEGER);
+    if (feeDifference) return feeDifference;
+    const nameDifference = compareText(left.zone_name ?? "", right.zone_name ?? "");
+    return nameDifference || compareText(left.zone_id ?? "", right.zone_id ?? "");
+  })[0];
+}
+
 export function mapSellerSummary(row: MarketplaceRow): SellerSummary {
   return {
     id: row.seller_id,
@@ -243,6 +284,8 @@ export function calculateAvailability(
     sellerMethods.includes(context.method) && productMethods.includes(context.method);
 
   if (row.seller_status !== "active") reasons.push("SELLER_NOT_ACTIVE");
+  if (row.verification_status !== "verified") reasons.push("SELLER_NOT_VERIFIED");
+  if (!row.psp_ready) reasons.push("SELLER_PAYMENT_NOT_READY");
   if (!row.accepting_new_orders || (row.paused_until && new Date(row.paused_until) > now)) {
     reasons.push("SELLER_PAUSED");
   }
@@ -328,12 +371,20 @@ function matchesFilter(product: CatalogProduct, context: CatalogContext) {
 }
 
 export async function catalog(context: CatalogContext) {
+  await reconcileExpiredOrders();
   const database = await ensureDemoDatabase();
   const result = await database
     .prepare(`${MARKETPLACE_SELECT} ORDER BY p.base_price_cents ASC`)
     .bind(context.requestedDate, context.method)
     .all<MarketplaceRow>();
-  const allProducts = result.results.map((row) => mapCatalogProduct(row, context));
+  const groupedRows = new Map<string, MarketplaceRow[]>();
+  for (const row of result.results) {
+    groupedRows.set(row.product_id, [...(groupedRows.get(row.product_id) ?? []), row]);
+  }
+  const allProducts = Array.from(groupedRows.values())
+    .map((rows) => chooseMarketplaceRow(rows, context))
+    .filter((row): row is MarketplaceRow => Boolean(row))
+    .map((row) => mapCatalogProduct(row, context));
   const products = allProducts.filter(
     (product) => product.availability.bookable && matchesFilter(product, context)
   );
@@ -348,14 +399,18 @@ export async function findMarketplaceRow(
   productReference: { id?: string; slug?: string },
   context: CatalogContext
 ): Promise<MarketplaceRow | null> {
+  await reconcileExpiredOrders();
   const database = await ensureDemoDatabase();
   const predicate = productReference.id ? "p.id = ?" : "p.slug = ?";
   const value = productReference.id ?? productReference.slug;
   if (!value) return null;
-  return database
-    .prepare(`${MARKETPLACE_SELECT} WHERE ${predicate} LIMIT 1`)
+  const result = await database
+    .prepare(
+      `${MARKETPLACE_SELECT} WHERE ${predicate} ORDER BY z.fee_cents ASC, z.name ASC, z.id ASC`
+    )
     .bind(context.requestedDate, context.method, value)
-    .first<MarketplaceRow>();
+    .all<MarketplaceRow>();
+  return chooseMarketplaceRow(result.results, context);
 }
 
 export async function productDetail(slug: string, context: CatalogContext) {

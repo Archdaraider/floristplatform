@@ -326,6 +326,16 @@ p {
   border-top: 1px solid var(--line-strong);
 }
 
+.plan-change-note {
+  max-width: 72ch;
+  margin: 12px 0 0;
+  padding-left: 12px;
+  border-left: 2px solid var(--amber-ink);
+  color: var(--ink-soft);
+  font-size: 0.72rem;
+  line-height: 1.5;
+}
+
 .method-control {
   margin: 0 0 18px;
   padding: 0;
@@ -1122,6 +1132,16 @@ textarea:focus {
   line-height: 1.55;
 }
 
+.dashboard-feedback--error {
+  border-left-color: var(--danger);
+  background: var(--danger-pale);
+  color: var(--danger);
+}
+
+.review-action-notice {
+  margin-block: 18px;
+}
+
 .cart-line {
   display: grid;
   margin: 32px 0;
@@ -1341,6 +1361,17 @@ textarea:focus {
   background: var(--danger-pale);
   color: var(--danger);
   font-size: 0.72rem;
+}
+
+.field-error {
+  color: var(--danger);
+  font-size: 0.66rem;
+  line-height: 1.35;
+}
+
+.checkout-form [aria-invalid="true"] {
+  border-color: var(--danger);
+  box-shadow: 0 0 0 2px rgba(157, 54, 46, 0.1);
 }
 
 .checkout-review {
@@ -1834,23 +1865,34 @@ textarea:focus {
   border-top: 1px solid var(--line);
 }
 
+.order-detail__facts > .order-detail__fact-wide {
+  grid-column: 1 / -1;
+  padding-left: 0;
+  border-left: 0;
+}
+
 .order-detail__facts span,
 .order-instructions span {
   color: var(--muted);
-  font-size: 0.59rem;
+  font-size: 0.68rem;
   text-transform: uppercase;
 }
 
 .order-detail__facts strong {
   overflow: hidden;
-  font-size: 0.73rem;
+  font-size: 0.82rem;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .order-detail__facts small {
   color: var(--muted);
-  font-size: 0.6rem;
+  font-size: 0.68rem;
+}
+
+.order-detail__fact-wide strong {
+  overflow: visible;
+  white-space: normal;
 }
 
 .order-instructions {
@@ -1865,6 +1907,49 @@ textarea:focus {
   color: var(--ink-soft);
   font-size: 0.7rem;
   line-height: 1.55;
+}
+
+.seller-message-thread {
+  margin: 22px 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--paper-quiet);
+}
+
+.seller-message-thread__heading {
+  display: flex;
+  padding: 16px 18px;
+  align-items: end;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.seller-message-thread__heading h3 {
+  margin: 3px 0 0;
+  font-family: var(--font-sans);
+  font-size: 0.88rem;
+  letter-spacing: -0.01em;
+}
+
+.seller-message-thread__heading > span {
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+}
+
+.seller-message-thread__list {
+  display: grid;
+  max-height: 300px;
+  padding: 16px 18px;
+  overflow-y: auto;
+  gap: 10px;
+}
+
+.seller-empty--compact {
+  min-height: 180px;
+  padding: 28px 0;
 }
 
 .seller-financials {
@@ -2480,26 +2565,26 @@ textarea:focus {
 }
 
 .message strong {
-  font-size: 0.66rem;
+  font-size: 0.72rem;
 }
 
 .message > div span,
 .message time {
   color: var(--muted);
-  font-size: 0.54rem;
+  font-size: 0.62rem;
 }
 
 .message p {
   margin: 6px 0;
   color: var(--ink-soft);
-  font-size: 0.66rem;
+  font-size: 0.72rem;
   line-height: 1.5;
 }
 
 .message-empty {
   margin: 0;
   color: var(--muted);
-  font-size: 0.67rem;
+  font-size: 0.72rem;
   line-height: 1.6;
 }
 
@@ -2512,7 +2597,7 @@ textarea:focus {
 
 .message-form textarea {
   min-height: 78px;
-  font-size: 0.7rem;
+  font-size: 0.78rem;
 }
 
 .message-form .secondary-button {

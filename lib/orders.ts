@@ -1,5 +1,6 @@
 import { ensureDemoDatabase } from "../db/bootstrap";
 import { ApiError } from "./api";
+import { reconcileExpiredOrders } from "./order-expiry";
 import {
   calculateAvailability,
   findMarketplaceRow,
@@ -71,6 +72,7 @@ interface OrderRow {
   seller_type: MarketplaceRow["seller_type"];
   seller_status: MarketplaceRow["seller_status"];
   verification_status: MarketplaceRow["verification_status"];
+  psp_ready: number;
   accepting_new_orders: number;
   paused_until: string | null;
   public_story: string;
@@ -116,6 +118,7 @@ SELECT
   s.seller_type,
   s.status AS seller_status,
   s.verification_status,
+  s.psp_ready,
   s.accepting_new_orders,
   s.paused_until,
   s.public_story,
@@ -165,6 +168,7 @@ function asMarketplaceSellerRow(row: OrderRow): MarketplaceRow {
     seller_type: row.seller_type,
     seller_status: row.seller_status,
     verification_status: row.verification_status,
+    psp_ready: row.psp_ready,
     accepting_new_orders: row.accepting_new_orders,
     paused_until: row.paused_until,
     public_story: row.public_story,
@@ -313,6 +317,7 @@ async function orderRowByIdempotency(key: string): Promise<OrderRow | null> {
 }
 
 export async function getOrderBundle(id: string) {
+  await reconcileExpiredOrders();
   const database = await ensureDemoDatabase();
   const row = await orderRowById(id);
   if (!row) throw new ApiError("ORDER_NOT_FOUND", "That order could not be found.", 404);
@@ -350,37 +355,113 @@ export async function getOrderBundle(id: string) {
   return { order: mapOrder(row, true) as OrderDetail, events, messages, demoMode: DEMO_MODE };
 }
 
-function validateOrderInput(input: CreateOrderInput) {
-  if (!input || typeof input !== "object") {
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function readText(
+  value: unknown,
+  field: string,
+  fields: Record<string, string>,
+  options: { required?: boolean; max: number }
+) {
+  if (value === undefined || value === null) {
+    if (options.required) fields[field] = "This field is required.";
+    return "";
+  }
+  if (typeof value !== "string") {
+    fields[field] = "Use text for this field.";
+    return "";
+  }
+  const trimmed = value.trim();
+  if (options.required && !trimmed) fields[field] = "This field is required.";
+  if (trimmed.length > options.max) {
+    fields[field] = `Keep this field to ${options.max} characters or fewer.`;
+  }
+  return trimmed;
+}
+
+function validateOrderInput(rawInput: unknown): CreateOrderInput {
+  if (!isRecord(rawInput)) {
     throw new ApiError("VALIDATION_FAILED", "Checkout details must be a JSON object.", 422);
   }
   const fields: Record<string, string> = {};
-  if (!input.productId && !input.productSlug) fields.product = "Choose a product.";
-  if (!input.requestedDate || !isValidLocalDate(input.requestedDate)) {
+  const productId = readText(rawInput.productId, "productId", fields, { max: 120 });
+  const productSlug = readText(rawInput.productSlug, "productSlug", fields, { max: 160 });
+  if (!productId && !productSlug) fields.product = "Choose a product.";
+  const requestedDate = readText(rawInput.requestedDate, "requestedDate", fields, {
+    required: true,
+    max: 10,
+  });
+  if (requestedDate && !isValidLocalDate(requestedDate)) {
     fields.requestedDate = "Use a valid YYYY-MM-DD date.";
   }
-  if (input.fulfilmentMethod !== "pickup" && input.fulfilmentMethod !== "delivery") {
+  const fulfilmentMethod = rawInput.fulfilmentMethod;
+  if (fulfilmentMethod !== "pickup" && fulfilmentMethod !== "delivery") {
     fields.fulfilmentMethod = "Use pickup or delivery.";
   }
-  if (!input.buyer?.name?.trim()) fields["buyer.name"] = "Buyer name is required.";
-  if (!/^\S+@\S+\.\S+$/.test(input.buyer?.email?.trim() ?? "")) {
+  const buyer = isRecord(rawInput.buyer) ? rawInput.buyer : {};
+  if (!isRecord(rawInput.buyer)) fields.buyer = "Buyer details are required.";
+  const buyerName = readText(buyer.name, "buyer.name", fields, { required: true, max: 120 });
+  const buyerEmail = readText(buyer.email, "buyer.email", fields, { required: true, max: 254 });
+  if (buyerEmail && !/^\S+@\S+\.\S+$/.test(buyerEmail)) {
     fields["buyer.email"] = "Enter a valid buyer email.";
   }
-  const quantity = input.quantity ?? 1;
+  const quantityRaw = rawInput.quantity ?? 1;
+  const quantity = typeof quantityRaw === "number" ? quantityRaw : Number.NaN;
   if (!Number.isInteger(quantity) || quantity < 1 || quantity > 10) {
     fields.quantity = "Quantity must be a whole number from 1 to 10.";
   }
-  if (input.fulfilmentMethod === "delivery") {
-    if (!/^\d{6}$/.test(input.postcode?.replace(/\s/g, "") ?? "")) {
+  const recipient = isRecord(rawInput.recipient) ? rawInput.recipient : {};
+  if (rawInput.recipient !== undefined && !isRecord(rawInput.recipient)) {
+    fields.recipient = "Recipient details must be an object.";
+  }
+  const recipientName = readText(recipient.name, "recipient.name", fields, {
+    required: true,
+    max: 120,
+  });
+  const recipientPhone = readText(recipient.phone, "recipient.phone", fields, {
+    required: true,
+    max: 40,
+  });
+  const recipientAddress = readText(recipient.address, "recipient.address", fields, { max: 300 });
+  const postcode = readText(rawInput.postcode, "postcode", fields, { max: 12 }).replace(/\s/g, "");
+  if (fulfilmentMethod === "delivery") {
+    if (!/^\d{6}$/.test(postcode)) {
       fields.postcode = "Enter a six-digit Singapore postcode.";
     }
-    if (!input.recipient?.address?.trim()) {
+    if (!recipientAddress) {
       fields["recipient.address"] = "Delivery address is required for seller-managed delivery.";
     }
   }
+  const window = readText(rawInput.window, "window", fields, { max: 120 });
+  const giftMessage = readText(rawInput.giftMessage, "giftMessage", fields, { max: 240 });
+  const deliveryInstructions = readText(
+    rawInput.deliveryInstructions,
+    "deliveryInstructions",
+    fields,
+    { max: 500 }
+  );
   if (Object.keys(fields).length) {
     throw new ApiError("VALIDATION_FAILED", "Some checkout details need attention.", 422, false, fields);
   }
+  return {
+    ...(productId ? { productId } : {}),
+    ...(productSlug ? { productSlug } : {}),
+    requestedDate,
+    fulfilmentMethod: fulfilmentMethod as FulfilmentMethod,
+    ...(postcode ? { postcode } : {}),
+    ...(window ? { window } : {}),
+    quantity: quantity as number,
+    buyer: { name: buyerName, email: buyerEmail },
+    recipient: {
+      name: recipientName,
+      phone: recipientPhone,
+      ...(recipientAddress ? { address: recipientAddress } : {}),
+    },
+    ...(giftMessage ? { giftMessage } : {}),
+    ...(deliveryInstructions ? { deliveryInstructions } : {}),
+  };
 }
 
 function orderContext(input: CreateOrderInput): CatalogContext {
@@ -401,11 +482,46 @@ function orderNumber(now: string) {
   return `FL-${date}-${suffix}`;
 }
 
-export async function createOrder(input: CreateOrderInput, idempotencyKey: string) {
-  validateOrderInput(input);
+function orderRetryMatches(row: OrderRow, input: CreateOrderInput) {
+  const snapshot = objectJson<ProductSnapshot>(row.product_snapshot_json);
+  const sameProduct = input.productId
+    ? row.product_id === input.productId
+    : snapshot.slug === input.productSlug;
+  return (
+    sameProduct &&
+    row.requested_date_local === input.requestedDate &&
+    row.fulfilment_method === input.fulfilmentMethod &&
+    row.quantity === (input.quantity ?? 1) &&
+    row.buyer_name === input.buyer.name &&
+    row.buyer_email === input.buyer.email.toLowerCase() &&
+    (row.recipient_name ?? "") === (input.recipient?.name ?? "") &&
+    (row.recipient_phone ?? "") === (input.recipient?.phone ?? "") &&
+    (row.recipient_address ?? "") === (input.recipient?.address ?? "") &&
+    (row.delivery_postcode ?? "") ===
+      (input.fulfilmentMethod === "delivery" ? input.postcode ?? "" : "") &&
+    (row.gift_message ?? "") === (input.giftMessage ?? "") &&
+    (row.delivery_instructions ?? "") === (input.deliveryInstructions ?? "") &&
+    (!input.window || row.window_label === input.window)
+  );
+}
+
+function idempotencyConflict() {
+  return new ApiError(
+    "IDEMPOTENCY_CONFLICT",
+    "That retry key was already used for different order details.",
+    409,
+    false,
+    undefined,
+    "Keep the same retry key only while retrying the exact same checkout request."
+  );
+}
+
+export async function createOrder(rawInput: unknown, idempotencyKey: string) {
+  const input = validateOrderInput(rawInput);
   const database = await ensureDemoDatabase();
   const existing = await orderRowByIdempotency(idempotencyKey);
   if (existing) {
+    if (!orderRetryMatches(existing, input)) throw idempotencyConflict();
     return { order: mapOrder(existing, true) as OrderDetail, demoMode: DEMO_MODE };
   }
 
@@ -431,6 +547,26 @@ export async function createOrder(input: CreateOrderInput, idempotencyKey: strin
       true,
       undefined,
       `Try another date or method. Availability reasons: ${reasons.join(", ")}.`
+    );
+  }
+
+  const canonicalWindow = availability.window;
+  if (!canonicalWindow) {
+    throw new ApiError(
+      "SLOT_UNAVAILABLE",
+      "No canonical fulfilment window is available for that plan.",
+      409,
+      true
+    );
+  }
+  if (input.window && input.window !== canonicalWindow) {
+    throw new ApiError(
+      "WINDOW_CHANGED",
+      "The selected fulfilment window is no longer available.",
+      409,
+      true,
+      { window: `Choose the current window: ${canonicalWindow}.` },
+      "Refresh availability before retrying checkout."
     );
   }
 
@@ -460,7 +596,9 @@ export async function createOrder(input: CreateOrderInput, idempotencyKey: strin
     representativePhotoDisclosure: marketplaceRow.representative_photo_disclosure,
   };
   const feeSnapshot: FeeSnapshot = {
-    ...(marketplaceRow.zone_name ? { deliveryZone: marketplaceRow.zone_name } : {}),
+    ...(input.fulfilmentMethod === "delivery" && marketplaceRow.zone_name
+      ? { deliveryZone: marketplaceRow.zone_name }
+      : {}),
     deliveryFeeCents: deliveryCents,
     commissionBps: marketplaceRow.commission_bps,
     gstRegistered: Boolean(marketplaceRow.gst_registered),
@@ -528,7 +666,7 @@ export async function createOrder(input: CreateOrderInput, idempotencyKey: strin
     input.fulfilmentMethod,
     input.requestedDate,
     MARKET_TIMEZONE,
-    input.window?.trim() || availability.window || "Scheduled window",
+    canonicalWindow,
     input.fulfilmentMethod === "delivery"
       ? input.postcode?.replace(/\s/g, "") || null
       : null,
@@ -621,6 +759,7 @@ export async function createOrder(input: CreateOrderInput, idempotencyKey: strin
   } catch (error) {
     const racedExisting = await orderRowByIdempotency(idempotencyKey);
     if (racedExisting) {
+      if (!orderRetryMatches(racedExisting, input)) throw idempotencyConflict();
       return { order: mapOrder(racedExisting, true) as OrderDetail, demoMode: DEMO_MODE };
     }
     throw error;
@@ -643,21 +782,55 @@ const ACTION_TARGET: Record<OrderAction, OperationalStatus> = {
 
 export async function transitionOrder(
   id: string,
-  input: TransitionOrderInput,
+  rawInput: unknown,
   idempotencyKey: string
 ) {
+  await reconcileExpiredOrders();
   const database = await ensureDemoDatabase();
   const row = await orderRowById(id);
   if (!row) throw new ApiError("ORDER_NOT_FOUND", "That order could not be found.", 404);
-  if (!input || typeof input !== "object" || !Object.hasOwn(ACTION_TARGET, input.action)) {
+  if (!isRecord(rawInput) || typeof rawInput.action !== "string" || !Object.hasOwn(ACTION_TARGET, rawInput.action)) {
     throw new ApiError("INVALID_ACTION", "That order action is not supported.", 422);
   }
+  if (rawInput.reason !== undefined && typeof rawInput.reason !== "string") {
+    throw new ApiError(
+      "INVALID_REASON",
+      "Order action reason must be text.",
+      422,
+      false,
+      { reason: "Use text up to 500 characters." }
+    );
+  }
+  const reason = typeof rawInput.reason === "string" ? rawInput.reason.trim() : "";
+  if (reason.length > 500) {
+    throw new ApiError(
+      "INVALID_REASON",
+      "Order action reason is too long.",
+      422,
+      false,
+      { reason: "Keep the reason to 500 characters or fewer." }
+    );
+  }
+  const input: TransitionOrderInput = {
+    action: rawInput.action as OrderAction,
+    ...(reason ? { reason } : {}),
+  };
 
   const previousEvent = await database
-    .prepare("SELECT id FROM order_events WHERE idempotency_key = ? LIMIT 1")
-    .bind(idempotencyKey)
-    .first<{ id: string }>();
-  if (previousEvent) return getOrderBundle(row.id);
+    .prepare(
+      "SELECT id, to_state, reason FROM order_events WHERE order_id = ? AND idempotency_key = ? LIMIT 1"
+    )
+    .bind(row.id, idempotencyKey)
+    .first<{ id: string; to_state: string | null; reason: string | null }>();
+  if (previousEvent) {
+    if (
+      previousEvent.to_state !== ACTION_TARGET[input.action] ||
+      (previousEvent.reason ?? "") !== (input.reason ?? "")
+    ) {
+      throw idempotencyConflict();
+    }
+    return getOrderBundle(row.id);
+  }
 
   const available = allowedActions(row.operational_status, row.fulfilment_method);
   if (!available.includes(input.action)) {
@@ -728,84 +901,25 @@ export async function transitionOrder(
               ? "production.preparing"
               : `order.${input.action === "accept" ? "accepted" : "declined"}`;
 
-  const updateOrder = database
-    .prepare(
-      `UPDATE orders SET
-        operational_status = ?, commercial_status = ?, payment_status = ?, payout_status = ?,
-        accepted_at = CASE WHEN ? = 'accept' THEN ? ELSE accepted_at END,
-        completed_at = CASE WHEN ? = 'fulfilled' THEN ? ELSE completed_at END,
-        version = version + 1, updated_at = ?
-       WHERE id = ? AND operational_status = ?
-         AND (? NOT IN ('accept', 'decline') OR EXISTS (
-           SELECT 1 FROM capacity_slots c
-           WHERE c.id = orders.capacity_slot_id AND c.reserved_capacity >= orders.quantity
-         ))`
-    )
-    .bind(
-      target,
-      commercialStatus,
-      paymentStatus,
-      payoutStatus,
-      input.action,
-      now,
-      input.action,
-      now,
-      now,
-      row.id,
-      row.operational_status,
-      input.action
-    );
-  const capacityDelta =
-    input.action === "accept"
-      ? database
-          .prepare(
-            `UPDATE capacity_slots SET
-              reserved_capacity = reserved_capacity - ?,
-              committed_capacity = committed_capacity + ?,
-              version = version + 1,
-              updated_at = ?
-             WHERE id = ? AND reserved_capacity >= ? AND EXISTS (
-               SELECT 1 FROM orders WHERE id = ? AND operational_status = ? AND updated_at = ?
-             )`
-          )
-          .bind(
-            row.quantity,
-            row.quantity,
-            now,
-            row.capacity_slot_id,
-            row.quantity,
-            row.id,
-            target,
-            now
-          )
-      : input.action === "decline"
-        ? database
-            .prepare(
-              `UPDATE capacity_slots SET
-                reserved_capacity = reserved_capacity - ?, version = version + 1, updated_at = ?
-               WHERE id = ? AND reserved_capacity >= ? AND EXISTS (
-                 SELECT 1 FROM orders WHERE id = ? AND operational_status = ? AND updated_at = ?
-               )`
-            )
-            .bind(
-              row.quantity,
-              now,
-              row.capacity_slot_id,
-              row.quantity,
-              row.id,
-              target,
-              now
-            )
-        : database.prepare("SELECT 1");
-  const insertEvent = database
+  const eventId = crypto.randomUUID();
+  const claimEvent = database
     .prepare(
       `INSERT INTO order_events
         (id, order_id, actor_role, event_type, from_state, to_state, reason, metadata_json, idempotency_key, created_at)
        SELECT ?, ?, 'seller', ?, ?, ?, ?, ?, ?, ?
-       WHERE EXISTS (SELECT 1 FROM orders WHERE id = ? AND operational_status = ? AND updated_at = ?)`
+       WHERE EXISTS (
+         SELECT 1 FROM orders o
+         WHERE o.id = ? AND o.operational_status = ?
+           AND (? NOT IN ('accept', 'decline') OR EXISTS (
+             SELECT 1 FROM capacity_slots c
+             WHERE c.id = o.capacity_slot_id AND c.reserved_capacity >= o.quantity
+           ))
+           AND (? != 'accept' OR o.accept_by >= ?)
+       )
+       ON CONFLICT(order_id, idempotency_key) DO NOTHING`
     )
     .bind(
-      crypto.randomUUID(),
+      eventId,
       row.id,
       eventType,
       row.operational_status,
@@ -823,34 +937,129 @@ export async function transitionOrder(
       idempotencyKey,
       now,
       row.id,
-      target,
+      row.operational_status,
+      input.action,
+      input.action,
       now
     );
+
+  const updateOrder = database
+    .prepare(
+      `UPDATE orders SET
+        operational_status = ?, commercial_status = ?, payment_status = ?, payout_status = ?,
+        accepted_at = CASE WHEN ? = 'accept' THEN ? ELSE accepted_at END,
+        completed_at = CASE WHEN ? = 'fulfilled' THEN ? ELSE completed_at END,
+        version = version + 1, updated_at = ?
+       WHERE id = ? AND operational_status = ?
+         AND EXISTS (
+           SELECT 1 FROM order_events e WHERE e.id = ? AND e.order_id = orders.id
+         )
+         AND (? NOT IN ('accept', 'decline') OR EXISTS (
+           SELECT 1 FROM capacity_slots c
+           WHERE c.id = orders.capacity_slot_id AND c.reserved_capacity >= orders.quantity
+         ))`
+    )
+    .bind(
+      target,
+      commercialStatus,
+      paymentStatus,
+      payoutStatus,
+      input.action,
+      now,
+      input.action,
+      now,
+      now,
+      row.id,
+      row.operational_status,
+      eventId,
+      input.action
+    );
+  const capacityDelta =
+    input.action === "accept"
+      ? database
+          .prepare(
+            `UPDATE capacity_slots SET
+              reserved_capacity = reserved_capacity - ?,
+              committed_capacity = committed_capacity + ?,
+              version = version + 1,
+              updated_at = ?
+             WHERE id = ? AND reserved_capacity >= ? AND EXISTS (
+               SELECT 1 FROM order_events e
+               JOIN orders o ON o.id = e.order_id
+               WHERE e.id = ? AND o.id = ? AND o.operational_status = ?
+             )`
+          )
+          .bind(
+            row.quantity,
+            row.quantity,
+            now,
+            row.capacity_slot_id,
+            row.quantity,
+            eventId,
+            row.id,
+            target
+          )
+      : input.action === "decline"
+        ? database
+            .prepare(
+              `UPDATE capacity_slots SET
+                reserved_capacity = reserved_capacity - ?, version = version + 1, updated_at = ?
+               WHERE id = ? AND reserved_capacity >= ? AND EXISTS (
+                 SELECT 1 FROM order_events e
+                 JOIN orders o ON o.id = e.order_id
+                 WHERE e.id = ? AND o.id = ? AND o.operational_status = ?
+               )`
+            )
+            .bind(
+              row.quantity,
+              now,
+              row.capacity_slot_id,
+              row.quantity,
+              eventId,
+              row.id,
+              target
+            )
+        : database.prepare("SELECT 1");
   const insertSystemMessage = database
     .prepare(
       `INSERT INTO messages
         (id, order_id, sender_role, sender_name, body, message_type, idempotency_key, created_at)
        SELECT ?, ?, 'system', 'Florist Platform', ?, 'system', ?, ?
-       WHERE EXISTS (SELECT 1 FROM orders WHERE id = ? AND operational_status = ? AND updated_at = ?)`
+       WHERE EXISTS (
+         SELECT 1 FROM order_events e WHERE e.id = ? AND e.order_id = ?
+       )`
     )
     .bind(
       crypto.randomUUID(),
       row.id,
       `Order updated: ${input.action.replaceAll("_", " ")}.`,
-      `${idempotencyKey}:message`,
+      `transition:${eventId}:message`,
       now,
+      eventId,
       row.id,
-      target,
-      now
     );
 
   const results = await database.batch([
+    claimEvent,
     updateOrder,
     capacityDelta,
-    insertEvent,
     insertSystemMessage,
   ]);
-  if ((results[0].meta.changes ?? 0) !== 1) {
+  if ((results[1].meta.changes ?? 0) !== 1) {
+    const replayedEvent = await database
+      .prepare(
+        "SELECT id, to_state, reason FROM order_events WHERE order_id = ? AND idempotency_key = ? LIMIT 1"
+      )
+      .bind(row.id, idempotencyKey)
+      .first<{ id: string; to_state: string | null; reason: string | null }>();
+    if (
+      replayedEvent &&
+      replayedEvent.to_state === target &&
+      (replayedEvent.reason ?? "") === (input.reason ?? "")
+    ) {
+      return getOrderBundle(row.id);
+    }
+    if (replayedEvent) throw idempotencyConflict();
     throw new ApiError(
       "ORDER_VERSION_CONFLICT",
       "The order changed while this action was being applied.",
@@ -865,13 +1074,25 @@ export async function transitionOrder(
 
 export async function addOrderMessage(
   orderId: string,
-  input: { senderRole?: MessageView["senderRole"]; senderName?: string; body?: string },
+  rawInput: unknown,
   idempotencyKey: string
 ) {
   const database = await ensureDemoDatabase();
   const row = await orderRowById(orderId);
   if (!row) throw new ApiError("ORDER_NOT_FOUND", "That order could not be found.", 404);
-  const body = input && typeof input === "object" ? input.body?.trim() ?? "" : "";
+  if (!isRecord(rawInput)) {
+    throw new ApiError("INVALID_MESSAGE", "Message details must be a JSON object.", 422);
+  }
+  if (typeof rawInput.body !== "string") {
+    throw new ApiError(
+      "INVALID_MESSAGE",
+      "Message body must be text.",
+      422,
+      false,
+      { body: "Enter a message up to 2,000 characters." }
+    );
+  }
+  const body = rawInput.body.trim();
   if (!body || body.length > 2_000) {
     throw new ApiError(
       "INVALID_MESSAGE",
@@ -881,15 +1102,52 @@ export async function addOrderMessage(
       { body: "Enter a message up to 2,000 characters." }
     );
   }
-  const senderRole = input.senderRole ?? "buyer";
-  if (!(["buyer", "seller", "support"] as string[]).includes(senderRole)) {
+  const senderRole = rawInput.senderRole ?? "buyer";
+  if (
+    typeof senderRole !== "string" ||
+    !(["buyer", "seller", "support"] as string[]).includes(senderRole)
+  ) {
     throw new ApiError("INVALID_SENDER", "Sender role must be buyer, seller, or support.", 422);
   }
+  if (rawInput.senderName !== undefined && typeof rawInput.senderName !== "string") {
+    throw new ApiError(
+      "INVALID_SENDER",
+      "Sender name must be text.",
+      422,
+      false,
+      { senderName: "Use a name up to 120 characters." }
+    );
+  }
+  const requestedSenderName =
+    typeof rawInput.senderName === "string" ? rawInput.senderName.trim() : "";
+  if (requestedSenderName.length > 120) {
+    throw new ApiError(
+      "INVALID_SENDER",
+      "Sender name is too long.",
+      422,
+      false,
+      { senderName: "Use a name up to 120 characters." }
+    );
+  }
+  const senderName =
+    requestedSenderName ||
+    (senderRole === "seller"
+      ? row.trading_name
+      : senderRole === "support"
+        ? "Platform support"
+        : row.buyer_name);
   const existing = await database
-    .prepare("SELECT * FROM messages WHERE idempotency_key = ? LIMIT 1")
-    .bind(idempotencyKey)
+    .prepare("SELECT * FROM messages WHERE order_id = ? AND idempotency_key = ? LIMIT 1")
+    .bind(row.id, idempotencyKey)
     .first<MessageRow>();
   if (existing) {
+    if (
+      existing.body !== body ||
+      existing.sender_role !== senderRole ||
+      existing.sender_name !== senderName
+    ) {
+      throw idempotencyConflict();
+    }
     return {
       message: {
         id: existing.id,
@@ -906,30 +1164,51 @@ export async function addOrderMessage(
   }
   const id = crypto.randomUUID();
   const now = nowIso();
-  const senderName =
-    input.senderName?.trim() ||
-    (senderRole === "seller" ? row.trading_name : senderRole === "support" ? "Platform support" : row.buyer_name);
   await database
     .prepare(
       `INSERT INTO messages
        (id, order_id, sender_role, sender_name, body, message_type, idempotency_key, created_at)
-       VALUES (?, ?, ?, ?, ?, 'message', ?, ?)`
+       VALUES (?, ?, ?, ?, ?, 'message', ?, ?)
+       ON CONFLICT(order_id, idempotency_key) DO NOTHING`
     )
-    .bind(id, row.id, senderRole, senderName, body, idempotencyKey, now)
+    .bind(id, row.id, senderRole as MessageView["senderRole"], senderName, body, idempotencyKey, now)
     .run();
+  const stored = await database
+    .prepare("SELECT * FROM messages WHERE order_id = ? AND idempotency_key = ? LIMIT 1")
+    .bind(row.id, idempotencyKey)
+    .first<MessageRow>();
+  if (!stored) {
+    throw new ApiError(
+      "MESSAGE_NOT_SAVED",
+      "The message could not be saved.",
+      500,
+      true,
+      undefined,
+      "Retry the message with the same idempotency key."
+    );
+  }
+  if (
+    stored.body !== body ||
+    stored.sender_role !== senderRole ||
+    stored.sender_name !== senderName
+  ) {
+    throw idempotencyConflict();
+  }
   const message: MessageView = {
-    id,
+    id: stored.id,
     orderId: row.id,
-    senderRole,
-    senderName,
-    body,
-    messageType: "message",
-    createdAt: now,
+    senderRole: stored.sender_role,
+    senderName: stored.sender_name,
+    body: stored.body,
+    messageType: stored.message_type,
+    ...(stored.read_at ? { readAt: stored.read_at } : {}),
+    createdAt: stored.created_at,
   };
   return { message, demoMode: DEMO_MODE };
 }
 
 export async function sellerOrders(sellerId: string): Promise<OrderView[]> {
+  await reconcileExpiredOrders();
   const database = await ensureDemoDatabase();
   const result = await database
     .prepare(

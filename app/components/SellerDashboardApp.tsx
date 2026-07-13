@@ -2,10 +2,11 @@
 
 /* eslint-disable @next/next/no-img-element */
 
-import { useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { normalizeProduct } from "./ConsumerMarketplace";
 import { PreviewNav } from "./PreviewNav";
+import { useAccessibleDialog } from "./useAccessibleDialog";
 import {
   formatSgd,
   formatSingaporeDate,
@@ -38,19 +39,13 @@ const emptyDashboard: DashboardState = {
     name: "Petal & Poem",
     area: "Tiong Bahru",
     sellerType: "Home studio",
-    verified: true,
-    acceptingOrders: true,
+    verified: false,
+    acceptingOrders: false,
   },
   orders: [],
   products: [],
   capacity: [],
 };
-
-const sampleCapacity = [
-  { date: "2026-07-13T00:00:00.000Z", used: 2, total: 6 },
-  { date: "2026-07-14T00:00:00.000Z", used: 4, total: 6 },
-  { date: "2026-07-15T00:00:00.000Z", used: 1, total: 5 },
-];
 
 function textFrom(value: unknown, fallback = "") {
   if (typeof value === "string") return value;
@@ -87,6 +82,7 @@ export function normalizeOrder(raw: Record<string, unknown>): Order {
     fulfilmentWindow: String(raw.fulfilmentWindow ?? raw.window ?? "Window to confirm"),
     postcode: String(raw.postcode ?? raw.deliveryPostcode ?? recipient.postcode ?? ""),
     addressLine: String(raw.addressLine ?? recipient.addressLine ?? recipient.address ?? ""),
+    deliveryInstructions: String(raw.deliveryInstructions ?? ""),
     publicPickupArea: String(
       raw.publicPickupArea ?? seller.publicAddress ?? seller.publicArea ?? "Collection location shown after confirmation",
     ),
@@ -135,8 +131,11 @@ function normalizeSeller(raw?: Record<string, unknown>): Seller {
     name: String(raw.name ?? raw.tradingName ?? emptyDashboard.seller.name),
     area: String(raw.area ?? raw.publicArea ?? emptyDashboard.seller.area),
     sellerType: String(raw.sellerType ?? raw.type ?? emptyDashboard.seller.sellerType),
-    verified: Boolean(raw.verified ?? true),
-    acceptingOrders: Boolean(raw.acceptingOrders ?? raw.acceptingNewOrders ?? true),
+    verified:
+      raw.verified !== undefined
+        ? Boolean(raw.verified)
+        : String(raw.verificationStatus ?? "") === "verified",
+    acceptingOrders: Boolean(raw.acceptingOrders ?? raw.acceptingNewOrders ?? false),
     story: raw.story ? String(raw.story) : undefined,
   };
 }
@@ -156,13 +155,32 @@ export function SellerDashboardApp() {
   const [activeTab, setActiveTab] = useState<"orders" | "catalogue" | "capacity">("orders");
   const [selectedId, setSelectedId] = useState<string>("");
   const [selectedDetail, setSelectedDetail] = useState<Order | null>(null);
+  const [detailError, setDetailError] = useState("");
   const [isLoading, setIsLoading] = useState(true);
+  const [hasLoadedDashboard, setHasLoadedDashboard] = useState(false);
+  const [refreshError, setRefreshError] = useState("");
   const [busyAction, setBusyAction] = useState("");
   const [feedback, setFeedback] = useState("");
   const [declineOpen, setDeclineOpen] = useState(false);
   const [declineReason, setDeclineReason] = useState("");
+  const dashboardRequest = useRef(0);
+  const hasLoadedDashboardRef = useRef(false);
+  const transitionKeys = useRef(new Map<string, string>());
+  const detailPanelRef = useRef<HTMLDivElement>(null);
+  const declineDialogRef = useRef<HTMLElement>(null);
+  const declineTextareaRef = useRef<HTMLTextAreaElement>(null);
+  useAccessibleDialog({
+    containerRef: declineDialogRef,
+    initialFocusRef: declineTextareaRef,
+    onClose: () => {
+      if (!busyAction) setDeclineOpen(false);
+    },
+    enabled: declineOpen,
+  });
 
   async function loadDashboard() {
+    const requestId = ++dashboardRequest.current;
+    if (!hasLoadedDashboardRef.current) setIsLoading(true);
     try {
       const response = await fetch("/api/v1/seller/dashboard", { cache: "no-store" });
       if (!response.ok) throw new Error("Dashboard unavailable");
@@ -178,12 +196,24 @@ export function SellerDashboardApp() {
           total: Number(slot.total ?? slot.capacity ?? 0),
         })),
       };
+      if (requestId !== dashboardRequest.current) return;
+      hasLoadedDashboardRef.current = true;
+      setHasLoadedDashboard(true);
+      setRefreshError("");
       setDashboard(next);
-      setSelectedId((current) => current || orders[0]?.id || "");
+      setSelectedId((current) =>
+        current && orders.some((order) => order.id === current) ? current : orders[0]?.id || "",
+      );
     } catch {
-      setFeedback("The operations service is reconnecting. New buyer orders will appear here when it is ready.");
+      if (requestId === dashboardRequest.current) {
+        setRefreshError(
+          hasLoadedDashboardRef.current
+            ? "The operations service could not refresh. Showing the last confirmed dashboard state."
+            : "The operations service could not load. Order intake and queue status remain unknown.",
+        );
+      }
     } finally {
-      setIsLoading(false);
+      if (requestId === dashboardRequest.current) setIsLoading(false);
     }
   }
 
@@ -197,9 +227,7 @@ export function SellerDashboardApp() {
   }, []);
 
   useEffect(() => {
-    if (!selectedId) {
-      return;
-    }
+    if (!selectedId) return;
     let cancelled = false;
     void fetch(`/api/v1/orders/${selectedId}`, { cache: "no-store" })
       .then(async (response) => {
@@ -209,6 +237,7 @@ export function SellerDashboardApp() {
       .then((data) => {
         if (cancelled) return;
         const orderRaw = (data.order ?? data) as Record<string, unknown>;
+        setDetailError("");
         setSelectedDetail(normalizeOrder({
           ...orderRaw,
           events: data.events ?? orderRaw.events,
@@ -216,12 +245,18 @@ export function SellerDashboardApp() {
         }));
       })
       .catch(() => {
-        if (!cancelled) setSelectedDetail(dashboard.orders.find((order) => order.id === selectedId) ?? null);
+        if (!cancelled) {
+          setDetailError("Full order details could not be loaded. Actions stay disabled until a refresh succeeds.");
+          setDeclineOpen(false);
+        }
       });
     return () => { cancelled = true; };
   }, [dashboard.orders, selectedId]);
 
-  const selectedOrder = selectedDetail ?? dashboard.orders.find((order) => order.id === selectedId) ?? null;
+  const selectedOrder =
+    (selectedDetail?.id === selectedId ? selectedDetail : null) ??
+    dashboard.orders.find((order) => order.id === selectedId) ??
+    null;
   const awaitingOrders = dashboard.orders.filter((order) => order.commercialStatus === "awaiting_seller");
   const activeOrders = dashboard.orders.filter((order) => !["declined", "cancelled", "completed"].includes(order.commercialStatus));
   const pendingPayout = dashboard.orders
@@ -239,13 +274,19 @@ export function SellerDashboardApp() {
   }, [dashboard.orders]);
 
   async function transitionOrder(action: string, reason?: string) {
-    if (!selectedOrder) return;
+    if (!selectedOrder || selectedDetail?.id !== selectedId || detailError) {
+      setFeedback("Wait for the full order details to load before applying a fulfilment action.");
+      return;
+    }
+    const commandKey = `${selectedOrder.id}:${action}:${reason ?? ""}`;
+    const requestKey = transitionKeys.current.get(commandKey) ?? crypto.randomUUID();
+    transitionKeys.current.set(commandKey, requestKey);
     setBusyAction(action);
     setFeedback("");
     try {
       const response = await fetch(`/api/v1/orders/${selectedOrder.id}`, {
         method: "PATCH",
-        headers: { "content-type": "application/json", "Idempotency-Key": crypto.randomUUID() },
+        headers: { "content-type": "application/json", "Idempotency-Key": requestKey },
         body: JSON.stringify({ action, actor: "seller", ...(reason ? { reason } : {}) }),
       });
       const data = (await response.json()) as Record<string, unknown>;
@@ -257,8 +298,10 @@ export function SellerDashboardApp() {
             : error && typeof error === "object"
               ? String((error as Record<string, unknown>).message ?? "The order could not be updated.")
               : "The order could not be updated.";
+        if (response.status < 500) transitionKeys.current.delete(commandKey);
         throw new Error(message);
       }
+      transitionKeys.current.delete(commandKey);
       const orderRaw = (data.order ?? data) as Record<string, unknown>;
       setSelectedDetail(normalizeOrder({ ...orderRaw, events: data.events, messages: data.messages }));
       setFeedback(`${actionLabels[action] ?? humanizeStatus(action)} recorded. The buyer view now reflects this state.`);
@@ -275,6 +318,7 @@ export function SellerDashboardApp() {
   }
 
   async function toggleAcceptingOrders() {
+    if (!hasLoadedDashboard || refreshError) return;
     setBusyAction("seller-setting");
     try {
       const response = await fetch("/api/v1/seller/settings", {
@@ -296,6 +340,7 @@ export function SellerDashboardApp() {
   }
 
   async function toggleProduct(product: Product) {
+    if (!hasLoadedDashboard || refreshError) return;
     setBusyAction(product.id);
     try {
       const nextStatus = product.status === "paused" ? "published" : "paused";
@@ -314,6 +359,67 @@ export function SellerDashboardApp() {
     }
   }
 
+  function selectOrder(orderId: string) {
+    setSelectedDetail(null);
+    setDetailError("");
+    setSelectedId(orderId);
+    setDeclineOpen(false);
+    if (window.matchMedia("(max-width: 768px)").matches) {
+      const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      window.requestAnimationFrame(() =>
+        detailPanelRef.current?.scrollIntoView({ behavior: reduceMotion ? "auto" : "smooth", block: "start" }),
+      );
+    }
+  }
+
+  async function sendSellerMessage(orderId: string, body: string, requestKey: string) {
+    setBusyAction("message");
+    setFeedback("");
+    try {
+      const response = await fetch(`/api/v1/orders/${orderId}/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "Idempotency-Key": requestKey },
+        body: JSON.stringify({
+          body,
+          senderRole: "seller",
+          senderName: dashboard.seller.name,
+        }),
+      });
+      const data = await response.json().catch(() => ({})) as Record<string, unknown>;
+      if (!response.ok) {
+        const apiError = data.error;
+        const message =
+          typeof apiError === "string"
+            ? apiError
+            : apiError && typeof apiError === "object"
+              ? String((apiError as Record<string, unknown>).message ?? "Message not sent.")
+              : "Message not sent.";
+        setFeedback(message);
+        return response.status >= 500 ? "retryable" as const : "rejected" as const;
+      }
+      const raw = (data.message ?? {}) as Record<string, unknown>;
+      const message: Message = {
+        id: String(raw.id ?? crypto.randomUUID()),
+        authorName: String(raw.senderName ?? dashboard.seller.name),
+        authorRole: (raw.senderRole ?? "seller") as Message["authorRole"],
+        body: String(raw.body ?? body),
+        createdAt: String(raw.createdAt ?? new Date().toISOString()),
+      };
+      setSelectedDetail((current) =>
+        current?.id === orderId
+          ? { ...current, messages: [...(current.messages ?? []), message] }
+          : current,
+      );
+      setFeedback("Message added to the buyer’s order thread.");
+      return "sent" as const;
+    } catch (caught) {
+      setFeedback(caught instanceof Error ? caught.message : "Message not sent.");
+      return "retryable" as const;
+    } finally {
+      setBusyAction("");
+    }
+  }
+
   return (
     <main className="seller-page">
       <PreviewNav active="seller" />
@@ -325,14 +431,18 @@ export function SellerDashboardApp() {
         <div className="seller-header__actions">
           <Link href="/" className="ghost-link">View storefront</Link>
           <button
-            className={`intake-toggle ${dashboard.seller.acceptingOrders ? "is-open" : ""}`}
+            className={`intake-toggle ${hasLoadedDashboard && dashboard.seller.acceptingOrders ? "is-open" : ""}`}
             type="button"
             onClick={() => void toggleAcceptingOrders()}
-            disabled={busyAction === "seller-setting"}
-            aria-pressed={Boolean(dashboard.seller.acceptingOrders)}
+            disabled={!hasLoadedDashboard || Boolean(refreshError) || busyAction === "seller-setting"}
+            aria-pressed={hasLoadedDashboard ? Boolean(dashboard.seller.acceptingOrders) : undefined}
           >
             <span className="intake-toggle__dot" aria-hidden="true" />
-            {dashboard.seller.acceptingOrders ? "Accepting orders" : "New orders paused"}
+            {!hasLoadedDashboard
+              ? "Checking order intake…"
+              : refreshError
+                ? "Order intake unavailable"
+                : dashboard.seller.acceptingOrders ? "Accepting orders" : "New orders paused"}
           </button>
         </div>
       </header>
@@ -343,15 +453,15 @@ export function SellerDashboardApp() {
             <span className="seller-monogram">PP</span>
             <div>
               <strong>{dashboard.seller.name}</strong>
-              <span>{dashboard.seller.area} · reviewed</span>
+              <span>{hasLoadedDashboard ? `${dashboard.seller.area} · reviewed` : "Seller status unavailable"}</span>
             </div>
           </div>
           <nav className="seller-tabs" aria-label="Seller dashboard sections">
             <button className={activeTab === "orders" ? "is-active" : ""} onClick={() => setActiveTab("orders")} type="button">
-              Orders <span>{activeOrders.length}</span>
+              Orders <span>{hasLoadedDashboard ? activeOrders.length : "—"}</span>
             </button>
             <button className={activeTab === "catalogue" ? "is-active" : ""} onClick={() => setActiveTab("catalogue")} type="button">
-              Catalogue <span>{dashboard.products.length}</span>
+              Catalogue <span>{hasLoadedDashboard ? dashboard.products.length : "—"}</span>
             </button>
             <button className={activeTab === "capacity" ? "is-active" : ""} onClick={() => setActiveTab("capacity")} type="button">
               Availability
@@ -368,7 +478,7 @@ export function SellerDashboardApp() {
             <div>
               <p className="eyebrow">Today’s operations</p>
               <h1>Good afternoon, Petal & Poem.</h1>
-              <p>{awaitingOrders.length ? `${awaitingOrders.length} request${awaitingOrders.length === 1 ? "" : "s"} need a decision before their confirmation deadline.` : "Your urgent queue is clear. The next fulfilment deadlines are below."}</p>
+              <p>{!hasLoadedDashboard ? "Checking the live order queue and intake controls." : awaitingOrders.length ? `${awaitingOrders.length} request${awaitingOrders.length === 1 ? "" : "s"} need a decision before their confirmation deadline.` : "Your urgent queue is clear. The next fulfilment deadlines are below."}</p>
             </div>
             <div className="seller-welcome__date">
               <span>Singapore time</span>
@@ -377,12 +487,13 @@ export function SellerDashboardApp() {
           </section>
 
           <section className="metric-ribbon" aria-label="Seller overview">
-            <div><span>Needs a response</span><strong>{awaitingOrders.length}</strong><small>sorted by confirm-by</small></div>
-            <div><span>Active orders</span><strong>{activeOrders.length}</strong><small>across pickup and delivery</small></div>
-            <div><span>Upcoming capacity</span><strong>{usedCapacity}/{totalCapacity || 18}</strong><small>units committed</small></div>
-            <div><span>Pending payout</span><strong>{formatSgd(pendingPayout)}</strong><small>after completion hold</small></div>
+            <div><span>Needs a response</span><strong>{hasLoadedDashboard ? awaitingOrders.length : "—"}</strong><small>sorted by confirm-by</small></div>
+            <div><span>Active orders</span><strong>{hasLoadedDashboard ? activeOrders.length : "—"}</strong><small>across pickup and delivery</small></div>
+            <div><span>Upcoming capacity</span><strong>{hasLoadedDashboard && totalCapacity ? `${usedCapacity}/${totalCapacity}` : "—"}</strong><small>{hasLoadedDashboard && totalCapacity ? "units committed" : hasLoadedDashboard ? "No slots configured" : "Checking availability"}</small></div>
+            <div><span>Pending payout</span><strong>{hasLoadedDashboard ? formatSgd(pendingPayout) : "—"}</strong><small>after completion hold</small></div>
           </section>
 
+          {refreshError && <p className="dashboard-feedback dashboard-feedback--error" role="status">{refreshError}</p>}
           {feedback && <p className="dashboard-feedback" role="status">{feedback}</p>}
 
           {activeTab === "orders" && (
@@ -394,11 +505,14 @@ export function SellerDashboardApp() {
                 </div>
                 {isLoading ? (
                   <div className="dashboard-skeleton" />
+                ) : !hasLoadedDashboard ? (
+                  <div className="seller-empty"><span className="seller-empty__mark" /><h3>Order queue unavailable</h3><p>Refresh to retry. No empty-queue claim is shown until the service confirms it.</p></div>
                 ) : orderedQueues.length ? orderedQueues.map((order) => (
                   <button
                     className={`order-queue__item ${selectedId === order.id ? "is-selected" : ""} ${order.commercialStatus === "awaiting_seller" ? "is-urgent" : ""}`}
                     type="button"
-                    onClick={() => setSelectedId(order.id)}
+                    onClick={() => selectOrder(order.id)}
+                    aria-pressed={selectedId === order.id}
                     key={order.id}
                   >
                     <span className={`order-status-dot status-${order.commercialStatus}`} aria-hidden="true" />
@@ -416,13 +530,19 @@ export function SellerDashboardApp() {
                 )}
               </div>
 
-              <div className="order-detail-panel">
+              <div className="order-detail-panel" ref={detailPanelRef}>
                 {selectedOrder ? (
                   <OrderDetail
+                    key={selectedOrder.id}
                     order={selectedOrder}
                     busyAction={busyAction}
+                    actionsEnabled={selectedDetail?.id === selectedId && !detailError}
+                    detailStatus={detailError || (selectedDetail?.id !== selectedId ? "Loading authorised fulfilment details before actions are enabled…" : "")}
                     onAction={(action) => void transitionOrder(action)}
                     onDecline={() => setDeclineOpen(true)}
+                    onSendMessage={(body, requestKey) =>
+                      sendSellerMessage(selectedOrder.id, body, requestKey)
+                    }
                   />
                 ) : (
                   <div className="order-detail-placeholder"><span>Select an order</span><p>Its next action, fulfilment context, payment state, and timeline will appear here.</p></div>
@@ -435,11 +555,13 @@ export function SellerDashboardApp() {
             <section className="catalogue-workspace">
               <div className="workspace-heading">
                 <div><p className="eyebrow">Storefront controls</p><h2>Catalogue</h2></div>
-                <button className="secondary-button" type="button" onClick={() => setFeedback("Catalogue creation is the next seller workflow to connect; this first version supports safe pause and restore actions.")}>Add arrangement</button>
+                <button className="secondary-button" type="button" disabled={!hasLoadedDashboard || Boolean(refreshError)} onClick={() => setFeedback("Catalogue creation is the next seller workflow to connect; this first version supports safe pause and restore actions.")}>Add arrangement</button>
               </div>
               <p className="workspace-description">Pause an arrangement without changing any order already placed. Price and policy details are snapshotted when buyers submit.</p>
               <div className="seller-product-list">
-                {dashboard.products.map((product) => (
+                {!hasLoadedDashboard ? (
+                  <div className="seller-empty seller-empty--compact"><h3>Catalogue unavailable</h3><p>Refresh the dashboard before changing storefront availability.</p></div>
+                ) : dashboard.products.length ? dashboard.products.map((product) => (
                   <article className="seller-product-row" key={product.id}>
                     <img src={product.imageUrl} alt="" />
                     <div>
@@ -447,11 +569,13 @@ export function SellerDashboardApp() {
                       <span>{product.style} · from {formatSgd(product.priceCents)}</span>
                       <small>{product.fulfilmentMethods.map(humanizeStatus).join(" + ")} · {product.leadTimeHours}h lead time</small>
                     </div>
-                    <button type="button" onClick={() => void toggleProduct(product)} disabled={busyAction === product.id}>
+                    <button type="button" onClick={() => void toggleProduct(product)} disabled={!hasLoadedDashboard || Boolean(refreshError) || busyAction === product.id}>
                       {product.status === "paused" ? "Restore" : "Pause"}
                     </button>
                   </article>
-                ))}
+                )) : (
+                  <div className="seller-empty seller-empty--compact"><h3>No arrangements configured</h3><p>Published and paused products will appear here.</p></div>
+                )}
               </div>
             </section>
           )}
@@ -466,19 +590,36 @@ export function SellerDashboardApp() {
                 <div className="capacity-card">
                   <span className="detail-label">Next seven days</span>
                   <div className="capacity-days">
-                    {(dashboard.capacity.length ? dashboard.capacity : sampleCapacity).map((slot) => (
+                    {hasLoadedDashboard && dashboard.capacity.map((slot) => (
                       <div className="capacity-day" key={slot.date}>
                         <div><strong>{formatSingaporeDate(slot.date)}</strong><span>{slot.total - slot.used} spaces open</span></div>
                         <div className="capacity-meter" aria-label={`${slot.used} of ${slot.total} capacity units used`}><span style={{ transform: `scaleX(${slot.total ? slot.used / slot.total : 0})` }} /></div>
                         <span>{slot.used}/{slot.total}</span>
                       </div>
                     ))}
+                    {!hasLoadedDashboard ? (
+                      <div className="seller-empty seller-empty--compact">
+                        <h3>Capacity unavailable</h3>
+                        <p>Refresh before treating any date as open or full.</p>
+                      </div>
+                    ) : !dashboard.capacity.length && (
+                      <div className="seller-empty seller-empty--compact">
+                        <h3>No upcoming capacity configured</h3>
+                        <p>Add availability before reopening intake for new dates.</p>
+                      </div>
+                    )}
                   </div>
                 </div>
                 <div className="settings-stack">
-                  <div className="settings-card"><span className="detail-label">Lead time</span><strong>24 hours</strong><p>Same-day cutoff remains disabled for beta.</p><button type="button" onClick={() => setFeedback("Lead-time editing is represented in this first build; the persisted rule editor is part of the next seller slice.")}>Edit rule</button></div>
-                  <div className="settings-card"><span className="detail-label">Delivery</span><strong>Central Singapore · S$10</strong><p>Seller-managed delivery in the configured postal sectors.</p><button type="button" onClick={() => setFeedback("Zone editing is represented in this first build; checkout already enforces the seeded service zone.")}>Manage zone</button></div>
-                  <div className="settings-card"><span className="detail-label">Home pickup</span><strong>Not enabled</strong><p>This home studio is delivery-only. Pickup requires seller opt-in and platform approval.</p><button type="button" onClick={() => setFeedback("Home-pickup review is a next-step workflow; exact home address data stays outside all public projections.")}>Review eligibility</button></div>
+                  {!hasLoadedDashboard ? (
+                    <div className="settings-card"><span className="detail-label">Fulfilment settings</span><strong>Status unavailable</strong><p>Refresh before relying on lead-time, delivery-zone, or pickup settings.</p></div>
+                  ) : (
+                    <>
+                      <div className="settings-card"><span className="detail-label">Lead time</span><strong>24 hours</strong><p>Same-day cutoff remains disabled for beta.</p><button type="button" onClick={() => setFeedback("Lead-time editing is represented in this first build; the persisted rule editor is part of the next seller slice.")}>Edit rule</button></div>
+                      <div className="settings-card"><span className="detail-label">Delivery</span><strong>Central Singapore · S$10</strong><p>Seller-managed delivery in the configured postal sectors.</p><button type="button" onClick={() => setFeedback("Zone editing is represented in this first build; checkout already enforces the seeded service zone.")}>Manage zone</button></div>
+                      <div className="settings-card"><span className="detail-label">Home pickup</span><strong>Not enabled</strong><p>This home studio is delivery-only. Pickup requires seller opt-in and platform approval.</p><button type="button" onClick={() => setFeedback("Home-pickup review is a next-step workflow; exact home address data stays outside all public projections.")}>Review eligibility</button></div>
+                    </>
+                  )}
                 </div>
               </div>
             </section>
@@ -494,7 +635,7 @@ export function SellerDashboardApp() {
             if (event.target === event.currentTarget && !busyAction) setDeclineOpen(false);
           }}
         >
-          <section className="checkout-dialog decline-dialog" role="dialog" aria-modal="true" aria-labelledby="decline-title">
+          <section ref={declineDialogRef} tabIndex={-1} className="checkout-dialog decline-dialog" role="dialog" aria-modal="true" aria-labelledby="decline-title">
             <button className="dialog-close" type="button" onClick={() => setDeclineOpen(false)} aria-label="Close decline form">×</button>
             <div className="checkout-dialog__intro">
               <p className="eyebrow">Decline {selectedOrder.orderNumber}</p>
@@ -505,12 +646,12 @@ export function SellerDashboardApp() {
               <label>
                 <span>Reason for declining</span>
                 <textarea
+                  ref={declineTextareaRef}
                   rows={4}
                   maxLength={500}
                   value={declineReason}
                   onChange={(event) => setDeclineReason(event.target.value)}
                   placeholder="For example: a required flower is no longer available from today’s shipment."
-                  autoFocus
                 />
               </label>
               <div className="decline-dialog__actions">
@@ -535,18 +676,46 @@ export function SellerDashboardApp() {
 function OrderDetail({
   order,
   busyAction,
+  actionsEnabled,
+  detailStatus,
   onAction,
   onDecline,
+  onSendMessage,
 }: {
   order: Order;
   busyAction: string;
+  actionsEnabled: boolean;
+  detailStatus: string;
   onAction: (action: string) => void;
   onDecline: () => void;
+  onSendMessage: (
+    body: string,
+    requestKey: string,
+  ) => Promise<"sent" | "retryable" | "rejected">;
 }) {
+  const [messageBody, setMessageBody] = useState("");
+  const messageKey = useRef("");
   const primaryActions = (order.allowedActions ?? []).filter((action) => action !== "decline");
   const actions = primaryActions.length
     ? primaryActions
     : order.commercialStatus === "awaiting_seller" ? ["accept"] : [];
+
+  async function submitMessage(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const body = messageBody.trim();
+    if (!actionsEnabled || !body || busyAction) return;
+    if (!messageKey.current) messageKey.current = crypto.randomUUID();
+    const result = await onSendMessage(body, messageKey.current);
+    if (result === "sent") {
+      setMessageBody("");
+      messageKey.current = "";
+    } else if (result === "rejected") {
+      // A deterministic 4xx means this command was not accepted. A corrected
+      // message must use a fresh idempotency key rather than conflict forever.
+      messageKey.current = "";
+    }
+  }
+
   return (
     <div className="order-detail">
       <div className="order-detail__heading">
@@ -560,17 +729,26 @@ function OrderDetail({
         <small>{order.commercialStatus === "awaiting_seller" ? `Decision by ${formatSingaporeDate(order.acceptBy, true)} SGT` : `${formatSingaporeDate(order.fulfilmentDate)} · ${order.fulfilmentWindow}`}</small>
       </div>
 
+      {detailStatus && <p className="dashboard-feedback dashboard-feedback--error" role="status">{detailStatus}</p>}
+
       <div className="order-detail__facts">
         <div><span>Fulfilment</span><strong>{humanizeStatus(order.fulfilmentMethod)}</strong><small>{formatSingaporeDate(order.fulfilmentDate)} · {order.fulfilmentWindow}</small></div>
         <div><span>Payment</span><strong>{humanizeStatus(order.paymentStatus)}</strong><small>{order.paymentStatus === "authorised" ? "Capture on acceptance" : "Demo PSP record"}</small></div>
         <div><span>Buyer</span><strong>{order.buyerName}</strong><small>{order.buyerEmail}</small></div>
         <div><span>Recipient</span><strong>{order.recipientName}</strong><small>{order.recipientPhone || "Contact in order record"}</small></div>
+        {order.fulfilmentMethod === "delivery" && (
+          <div className="order-detail__fact-wide"><span>Delivery destination</span><strong>{order.addressLine || "Address unavailable"}</strong><small>{order.postcode ? `Singapore ${order.postcode}` : "Postcode unavailable"}</small></div>
+        )}
+        {order.fulfilmentMethod === "pickup" && (
+          <div className="order-detail__fact-wide"><span>Pickup handoff</span><strong>{order.privatePickupInstructions || order.publicPickupArea || "Confirm collection details in the thread"}</strong><small>Visible in this authorised order workspace</small></div>
+        )}
       </div>
 
-      {(order.cardMessage || order.substitutionPreference) && (
+      {(order.cardMessage || order.substitutionPreference || order.deliveryInstructions) && (
         <div className="order-instructions">
           {order.cardMessage && <div><span>Gift message</span><p>“{order.cardMessage}”</p></div>}
           {order.substitutionPreference && <div><span>Substitution preference</span><p>{humanizeStatus(order.substitutionPreference)}</p></div>}
+          {order.deliveryInstructions && <div><span>Delivery instructions</span><p>{order.deliveryInstructions}</p></div>}
         </div>
       )}
 
@@ -583,15 +761,35 @@ function OrderDetail({
       {(actions.length > 0 || order.allowedActions?.includes("decline")) && (
         <div className="order-actions">
           {actions.map((action) => (
-            <button className="primary-button" type="button" key={action} onClick={() => onAction(action)} disabled={Boolean(busyAction)}>
+            <button className="primary-button" type="button" key={action} onClick={() => onAction(action)} disabled={!actionsEnabled || Boolean(busyAction)}>
               <span>{busyAction === action ? "Updating…" : actionLabels[action] ?? humanizeStatus(action)}</span><span className="button-arrow" aria-hidden="true">→</span>
             </button>
           ))}
           {(order.allowedActions?.includes("decline") || order.commercialStatus === "awaiting_seller") && (
-            <button className="decline-button" type="button" onClick={onDecline} disabled={Boolean(busyAction)}>Decline with reason</button>
+            <button className="decline-button" type="button" onClick={onDecline} disabled={!actionsEnabled || Boolean(busyAction)}>Decline with reason</button>
           )}
         </div>
       )}
+
+      <section className="seller-message-thread" aria-labelledby={`seller-thread-${order.id}`}>
+        <div className="seller-message-thread__heading">
+          <div><span className="detail-label">Order conversation</span><h3 id={`seller-thread-${order.id}`}>Buyer and florist messages</h3></div>
+          <span>{order.messages?.length ?? 0}</span>
+        </div>
+        <div className="seller-message-thread__list">
+          {order.messages?.length ? order.messages.map((message) => (
+            <div className={`message message--${message.authorRole}`} key={message.id}>
+              <div><strong>{message.authorName}</strong><span>{humanizeStatus(message.authorRole)}</span></div>
+              <p>{message.body}</p>
+              <time>{formatSingaporeDate(message.createdAt, true)}</time>
+            </div>
+          )) : <p className="message-empty">No messages yet. Keep delivery and substitution decisions in this order thread.</p>}
+        </div>
+        <form className="message-form" onSubmit={submitMessage}>
+          <label><span>Reply to buyer</span><textarea rows={3} maxLength={500} value={messageBody} onChange={(event) => setMessageBody(event.target.value)} placeholder="Share an order-specific update" required /></label>
+          <button className="secondary-button" type="submit" disabled={!actionsEnabled || !messageBody.trim() || Boolean(busyAction)}>{busyAction === "message" ? "Sending…" : "Send update"}</button>
+        </form>
+      </section>
 
       <div className="order-timeline">
         <span className="detail-label">Order timeline</span>

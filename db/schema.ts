@@ -258,7 +258,10 @@ export const orderEvents = sqliteTable(
   },
   (table) => [
     index("order_events_order_created_idx").on(table.orderId, table.createdAt),
-    uniqueIndex("order_events_idempotency_key_unique").on(table.idempotencyKey),
+    uniqueIndex("order_events_order_idempotency_key_unique").on(
+      table.orderId,
+      table.idempotencyKey
+    ),
   ]
 );
 
@@ -283,7 +286,10 @@ export const messages = sqliteTable(
   },
   (table) => [
     index("messages_order_created_idx").on(table.orderId, table.createdAt),
-    uniqueIndex("messages_idempotency_key_unique").on(table.idempotencyKey),
+    uniqueIndex("messages_order_idempotency_key_unique").on(
+      table.orderId,
+      table.idempotencyKey
+    ),
     check("messages_body_not_empty", sql`length(${table.body}) > 0`),
   ]
 );

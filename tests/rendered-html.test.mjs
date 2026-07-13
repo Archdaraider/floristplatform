@@ -124,6 +124,38 @@ async function render(pathname = "/") {
   });
 }
 
+async function jsonRequest(pathname, init = {}) {
+  const response = await fetch(`${baseUrl}${pathname}`, init);
+  const body = await response.json();
+  return { response, body };
+}
+
+function singaporeDateFromNow(days) {
+  const date = new Date(Date.now() + days * 86_400_000);
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Singapore",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(date);
+}
+
+async function findBookableDelivery() {
+  for (let days = 3; days <= 13; days += 1) {
+    const date = singaporeDateFromNow(days);
+    const query = new URLSearchParams({
+      date,
+      method: "delivery",
+      postcode: "160042",
+      budget: "200",
+    });
+    const { response, body } = await jsonRequest(`/api/v1/catalog?${query}`);
+    assert.equal(response.status, 200);
+    if (body.products?.[0]) return { date, product: body.products[0] };
+  }
+  throw new Error("No bookable delivery product found for API validation tests.");
+}
+
 test("server-renders the consumer marketplace", async () => {
   const response = await render("/");
   assert.equal(response.status, 200);
@@ -148,7 +180,7 @@ test("server-renders the seller action queue", async () => {
   assert.match(html, /Seller studio/);
   assert.match(html, /Action queue/);
   assert.match(html, /Orders by next deadline/);
-  assert.match(html, /Accepting orders/);
+  assert.match(html, /Checking order intake/);
   assert.match(html, /Pending payout/);
 });
 
@@ -164,12 +196,176 @@ test("server-renders the operations console", async () => {
   assert.match(html, /Privacy guard represented/);
 });
 
+test("rejects malformed mutation payloads with field-level validation", async () => {
+  const { response, body } = await jsonRequest("/api/v1/orders", {
+    method: "POST",
+    headers: { "content-type": "application/json", "Idempotency-Key": "test:wrong-types" },
+    body: JSON.stringify({
+      productId: "product-blush-garden",
+      requestedDate: singaporeDateFromNow(4),
+      fulfilmentMethod: "delivery",
+      postcode: "160042",
+      buyer: { name: 42, email: "jamie@example.com" },
+      recipient: { name: "Alicia", phone: "91234821", address: "20 Tiong Bahru Road" },
+    }),
+  });
+
+  assert.equal(response.status, 422);
+  assert.equal(body.error.code, "VALIDATION_FAILED");
+  assert.match(body.error.fieldErrors["buyer.name"], /text|required/i);
+
+  const settings = await jsonRequest("/api/v1/seller/settings", {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ acceptingNewOrders: false, pausedUntil: "not-a-date" }),
+  });
+  assert.equal(settings.response.status, 422);
+  assert.equal(settings.body.error.code, "INVALID_SETTINGS");
+  assert.match(settings.body.error.fieldErrors.pausedUntil, /ISO date-time/i);
+});
+
+test("scopes message idempotency to the requested order and payload", async () => {
+  const headers = {
+    "content-type": "application/json",
+    "Idempotency-Key": "seed:message-awaiting-buyer",
+  };
+  const input = {
+    senderRole: "buyer",
+    senderName: "Alex",
+    body: "Cross-order replay protection stays scoped to this order.",
+  };
+  const first = await jsonRequest("/api/v1/orders/order-demo-ready/messages", {
+    method: "POST",
+    headers,
+    body: JSON.stringify(input),
+  });
+  assert.equal(first.response.status, 201);
+  assert.equal(first.body.message.orderId, "order-demo-ready");
+
+  const mismatch = await jsonRequest("/api/v1/orders/order-demo-ready/messages", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ ...input, body: "A different command payload." }),
+  });
+  assert.equal(mismatch.response.status, 409);
+  assert.equal(mismatch.body.error.code, "IDEMPOTENCY_CONFLICT");
+});
+
+test("blocks cross-wired order retries and tampered fulfilment windows", async () => {
+  const conflicting = await jsonRequest("/api/v1/orders", {
+    method: "POST",
+    headers: { "content-type": "application/json", "Idempotency-Key": "seed:order-demo-ready" },
+    body: JSON.stringify({
+      productId: "product-blush-garden",
+      requestedDate: singaporeDateFromNow(4),
+      fulfilmentMethod: "delivery",
+      postcode: "160042",
+      quantity: 1,
+      buyer: { name: "Different Buyer", email: "different@example.com" },
+      recipient: { name: "Alicia", phone: "91234821", address: "20 Tiong Bahru Road" },
+    }),
+  });
+  assert.equal(conflicting.response.status, 409);
+  assert.equal(conflicting.body.error.code, "IDEMPOTENCY_CONFLICT");
+
+  const { date, product } = await findBookableDelivery();
+  const tampered = await jsonRequest("/api/v1/orders", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "Idempotency-Key": `test:tampered-window:${Date.now()}`,
+    },
+    body: JSON.stringify({
+      productId: product.id,
+      requestedDate: date,
+      fulfilmentMethod: "delivery",
+      postcode: "160042",
+      window: "12:00 am–1:00 am",
+      quantity: 1,
+      buyer: { name: "Jamie Lim", email: "jamie@example.com" },
+      recipient: { name: "Alicia", phone: "91234821", address: "20 Tiong Bahru Road" },
+    }),
+  });
+  assert.equal(tampered.response.status, 409);
+  assert.equal(tampered.body.error.code, "WINDOW_CHANGED");
+});
+
+test("serializes concurrent transition and message retries", async () => {
+  const { date, product } = await findBookableDelivery();
+  const orderKey = `test:concurrent-order:${crypto.randomUUID()}`;
+  const orderInput = {
+    productId: product.id,
+    requestedDate: date,
+    fulfilmentMethod: "delivery",
+    postcode: "160042",
+    window: product.availability.window,
+    quantity: 1,
+    buyer: { name: "Concurrency Test", email: "concurrency@example.com" },
+    recipient: {
+      name: "Concurrency Recipient",
+      phone: "91234821",
+      address: "20 Tiong Bahru Road",
+    },
+  };
+  const created = await jsonRequest("/api/v1/orders", {
+    method: "POST",
+    headers: { "content-type": "application/json", "Idempotency-Key": orderKey },
+    body: JSON.stringify(orderInput),
+  });
+  assert.equal(created.response.status, 201);
+  const orderId = created.body.order.id;
+
+  const transitionKey = `test:concurrent-decline:${crypto.randomUUID()}`;
+  const transition = () => jsonRequest(`/api/v1/orders/${orderId}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json", "Idempotency-Key": transitionKey },
+    body: JSON.stringify({
+      action: "decline",
+      reason: "Concurrency test releases this reservation exactly once.",
+    }),
+  });
+  const transitions = await Promise.all([transition(), transition()]);
+  assert.deepEqual(transitions.map(({ response }) => response.status), [200, 200]);
+
+  const messageKey = `test:concurrent-message:${crypto.randomUUID()}`;
+  const messageInput = {
+    senderRole: "buyer",
+    senderName: "Concurrency Test",
+    body: "This exact retry should create one stored message.",
+  };
+  const sendMessage = () => jsonRequest(`/api/v1/orders/${orderId}/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "Idempotency-Key": messageKey },
+    body: JSON.stringify(messageInput),
+  });
+  const messages = await Promise.all([sendMessage(), sendMessage()]);
+  assert.deepEqual(messages.map(({ response }) => response.status), [201, 201]);
+  assert.equal(messages[0].body.message.id, messages[1].body.message.id);
+
+  const detail = await jsonRequest(`/api/v1/orders/${orderId}`);
+  assert.equal(detail.response.status, 200);
+  assert.equal(
+    detail.body.events.filter((event) => event.eventType === "order.declined").length,
+    1,
+  );
+  assert.equal(
+    detail.body.messages.filter((message) => message.body === messageInput.body).length,
+    1,
+  );
+});
+
 test("finished source has product metadata and interaction guardrails", async () => {
-  const [page, layout, css, packageJson] = await Promise.all([
+  const [page, layout, css, packageJson, consumer, seller, admin, tracker, dialogHook, serviceWorker] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
+    readFile(new URL("../app/components/ConsumerMarketplace.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/components/SellerDashboardApp.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/components/AdminConsoleApp.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/components/OrderTrackerApp.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/components/useAccessibleDialog.ts", import.meta.url), "utf8"),
+    readFile(new URL("../public/sw.js", import.meta.url), "utf8"),
   ]);
 
   assert.match(page + layout, /Petalfolk/);
@@ -180,4 +376,18 @@ test("finished source has product metadata and interaction guardrails", async ()
   assert.doesNotMatch(css, /transition:\s*all\b/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
   assert.doesNotMatch(page + layout, /codex-preview|_sites-preview/);
+  assert.match(consumer, /CartItem[\s\S]*plan: MarketplacePlan/);
+  assert.match(consumer, /requestKey\.current/);
+  assert.match(seller, /selectedDetail\?\.id === selectedId/);
+  assert.match(seller, /actionsEnabled=\{selectedDetail\?\.id === selectedId && !detailError\}/);
+  assert.match(seller, /Delivery destination/);
+  assert.doesNotMatch(seller + admin, /sampleCapacity|sampleReviews|sampleExceptions|sampleEvents/);
+  assert.match(tracker, /out_for_delivery/);
+  assert.match(tracker, /formElement\.reset\(\)/);
+  assert.match(dialogHook, /event\.key === "Escape"/);
+  assert.match(dialogHook, /event\.key !== "Tab"/);
+  assert.match(dialogHook, /element\.inert = true/);
+  assert.match(serviceWorker, /PRIVATE_ROUTE_PREFIXES/);
+  assert.match(serviceWorker, /no-store\|private/);
+  assert.match(serviceWorker, /offline\.html/);
 });

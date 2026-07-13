@@ -47,8 +47,10 @@ paths:
       description: |
         Returns only products that are bookable for the supplied availability context and that
         exactly match any `style` and `occasion` filters. Sellers are de-duplicated from the
-        returned products. An unsupported postcode or unavailable slot produces an empty list,
-        rather than returning non-bookable products.
+        returned products. When delivery zones overlap, exactly one postcode-matching zone is
+        selected deterministically by fee, name, and zone ID. Expired reservations are reconciled before
+        availability is calculated. An unsupported postcode or unavailable slot produces an
+        empty list, rather than returning non-bookable products.
       operationId: listCatalogProducts
       parameters:
         - $ref: '#/components/parameters/CatalogDate'
@@ -161,8 +163,10 @@ paths:
       description: |
         Rechecks availability, atomically reserves capacity, creates an order, records an event,
         and inserts a system message. Payment authorisation is simulated. Supply an
-        `Idempotency-Key` to make retries return the originally created order. If omitted, the
-        server generates a one-use key, so a client retry can create another order.
+        `Idempotency-Key` to make an exact retry return the originally created order. Reusing the
+        key with different order details returns `409 IDEMPOTENCY_CONFLICT`. The submitted window
+        must match the server-derived capacity window. If the key is omitted, the server generates
+        a one-use key, so a client retry can create another order.
       operationId: createOrder
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -245,8 +249,9 @@ paths:
         update reserved capacity and simulate payment capture or voiding. Fulfilment makes the
         simulated payout available. A decline requires a reason.
 
-        Supply an `Idempotency-Key` for safe retries. Keys should be globally unique within this
-        demo database; a replay returns the current bundle without applying the transition again.
+        Supply an `Idempotency-Key` for safe retries. Keys are scoped to the requested order; an
+        exact replay returns the current bundle without applying the transition again, while
+        reusing the key with a different action or reason returns `409 IDEMPOTENCY_CONFLICT`.
       operationId: transitionOrder
       parameters:
         - $ref: '#/components/parameters/OrderId'
@@ -293,8 +298,9 @@ paths:
       description: |
         Adds a buyer, seller, or support message to the order conversation. The default role is
         `buyer`, and the sender name defaults to the order buyer, florist trading name, or
-        `Platform support` according to the role. Supply an `Idempotency-Key` for safe retries;
-        keys should be globally unique within the demo database.
+        `Platform support` according to the role. Supply an `Idempotency-Key` for safe retries.
+        Keys are scoped to the requested order; an exact replay returns the original message,
+        while reusing the key with a different message payload returns `409 IDEMPOTENCY_CONFLICT`.
       operationId: addOrderMessage
       parameters:
         - $ref: '#/components/parameters/OrderId'
@@ -320,6 +326,8 @@ paths:
         '400':
           $ref: '#/components/responses/ErrorResponse'
         '404':
+          $ref: '#/components/responses/ErrorResponse'
+        '409':
           $ref: '#/components/responses/ErrorResponse'
         '422':
           $ref: '#/components/responses/ErrorResponse'
@@ -362,8 +370,10 @@ paths:
       summary: Update main demo seller availability settings
       description: |
         Updates the fixed main demo seller. `acceptingNewOrders` takes precedence when supplied;
-        otherwise `paused` is inverted to derive it. Accepting orders clears `pausedUntil` and
-        sets the seller status to `active`; not accepting sets the status to `paused`.
+        otherwise `paused` is inverted to derive it. For an active or paused seller, accepting
+        orders clears `pausedUntil` and sets the status to `active`, while not accepting sets it
+        to `paused`. Restricted and suspended statuses are preserved, and attempting to reopen
+        intake for either returns `409 SELLER_RESTRICTED`.
       operationId: updateSellerSettings
       parameters:
         - $ref: '#/components/parameters/CorrelationId'
@@ -391,6 +401,8 @@ paths:
         '400':
           $ref: '#/components/responses/ErrorResponse'
         '404':
+          $ref: '#/components/responses/ErrorResponse'
+        '409':
           $ref: '#/components/responses/ErrorResponse'
         '422':
           $ref: '#/components/responses/ErrorResponse'
@@ -535,13 +547,14 @@ components:
       in: header
       required: false
       description: |
-        Caller-generated retry key. Reusing a key returns the existing result without repeating
-        the write. Keys should be globally unique across commands in this demo database. When the
-        header is absent or blank, the server generates a new key and client retries are not
-        idempotent.
+        Caller-generated retry key. Message and transition keys are scoped to the requested order;
+        exact replays return the existing result, while a changed payload returns `409`. Order
+        creation keys also reject changed checkout details. When the header is absent or blank,
+        the server generates a new key and client retries are not idempotent.
       schema:
         type: string
         minLength: 1
+        maxLength: 200
       example: 42c2fb07-8a18-43ae-a008-order-create-1
 
     CorrelationId:
@@ -664,6 +677,8 @@ components:
       type: string
       enum:
         - SELLER_NOT_ACTIVE
+        - SELLER_NOT_VERIFIED
+        - SELLER_PAYMENT_NOT_READY
         - SELLER_PAUSED
         - PRODUCT_NOT_PUBLISHED
         - METHOD_DISABLED
@@ -732,7 +747,9 @@ components:
           type: boolean
         pausedUntil:
           type: string
-          description: Stored seller pause marker; the current settings command does not validate its format.
+          format: date-time
+          maxLength: 40
+          description: Validated ISO date-time stored while marketplace intake is paused.
 
     SellerAccount:
       allOf:
@@ -1066,19 +1083,27 @@ components:
         name:
           type: string
           minLength: 1
+          maxLength: 120
         email:
           type: string
           format: email
+          maxLength: 254
 
     Recipient:
       type: object
+      required: [name, phone]
       properties:
         name:
           type: string
+          minLength: 1
+          maxLength: 120
         phone:
           type: string
+          minLength: 1
+          maxLength: 40
         address:
           type: string
+          maxLength: 300
 
     OrderDetail:
       allOf:
@@ -1147,7 +1172,7 @@ components:
 
     CreateOrderInput:
       type: object
-      required: [requestedDate, fulfilmentMethod, buyer]
+      required: [requestedDate, fulfilmentMethod, buyer, recipient]
       anyOf:
         - required: [productId]
         - required: [productSlug]
@@ -1155,19 +1180,23 @@ components:
         productId:
           type: string
           minLength: 1
+          maxLength: 120
         productSlug:
           type: string
           minLength: 1
+          maxLength: 160
         requestedDate:
           $ref: '#/components/schemas/LocalDate'
         fulfilmentMethod:
           $ref: '#/components/schemas/FulfilmentMethod'
         postcode:
           type: string
-          description: Required for delivery after spaces are removed; must be six digits.
+          maxLength: 12
+          description: Required for delivery; after trimming it is limited to 12 characters, and after spaces are removed it must be six digits.
         window:
           type: string
-          description: Optional client-selected display label; availability still determines bookability.
+          maxLength: 120
+          description: Optional selected label; when supplied, it must equal the current server-derived capacity window.
         quantity:
           type: integer
           minimum: 1
@@ -1179,8 +1208,10 @@ components:
           $ref: '#/components/schemas/Recipient'
         giftMessage:
           type: string
+          maxLength: 240
         deliveryInstructions:
           type: string
+          maxLength: 500
       allOf:
         - if:
             properties:
@@ -1192,7 +1223,7 @@ components:
             properties:
               postcode:
                 type: string
-                pattern: '^\\s*[0-9](?:\\s*[0-9]){5}\\s*$'
+                pattern: '^\s*[0-9](?:\s*[0-9]){5}\s*$'
               recipient:
                 type: object
                 required: [address]
@@ -1209,6 +1240,7 @@ components:
           $ref: '#/components/schemas/OrderAction'
         reason:
           type: string
+          maxLength: 500
       allOf:
         - if:
             properties:
@@ -1232,6 +1264,7 @@ components:
           default: buyer
         senderName:
           type: string
+          maxLength: 120
           description: Optional display-name override; blank values use the role-specific default.
         body:
           type: string
@@ -1262,8 +1295,14 @@ components:
           type: boolean
           description: Used only when `acceptingNewOrders` is absent; it is inverted to derive that value.
         pausedUntil:
-          type: [string, 'null']
-          description: Stored as supplied when pausing; null or blank clears the value.
+          description: A valid ISO date-time is stored when pausing; null or blank clears the value.
+          oneOf:
+            - type: string
+              format: date-time
+              maxLength: 40
+            - type: string
+              const: ''
+            - type: 'null'
           examples:
             - '2026-07-20T00:00:00.000Z'
             - null
