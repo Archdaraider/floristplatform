@@ -1,0 +1,1668 @@
+openapi: 3.1.0
+jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
+
+info:
+  title: Petalfolk Singapore Florist Marketplace Demo API
+  version: 0.1.0
+  summary: Implemented API contract for the MVP consumer, seller, and admin vertical slice.
+  description: |
+    This document describes only the `/api/v1` endpoints implemented by the MVP.
+
+    **Demo mode is always enabled.** Data is stored in the demo database, the seller and
+    admin views use fixed demo personas, and no API authentication or authorisation is
+    enforced. Payment authorisation, capture, voiding, payout status, and related references
+    are simulations; no real payment provider or settlement rail is called.
+
+    Monetary integer fields are Singapore-dollar cents unless explicitly described otherwise.
+    Dates and operational deadlines use the `Asia/Singapore` marketplace context. Every JSON
+    success envelope exposes `demoMode: true`, and every error uses the stable `ApiErrorEnvelope`.
+
+servers:
+  - url: /
+    description: Same origin as the running local or preview application.
+
+security: []
+
+x-demo-mode:
+  enabled: true
+  persistence: Demo database
+  authentication: None
+  payments: Simulated authorisation, capture, void, and payout state transitions
+
+tags:
+  - name: Catalog
+    description: Consumer discovery and product detail with one shared availability calculation.
+  - name: Orders
+    description: Demo checkout, order tracking, seller transitions, and order messages.
+  - name: Seller
+    description: Fixed main-demo-seller dashboard and settings commands.
+  - name: Admin
+    description: Read-only operational overview for the demo marketplace.
+
+paths:
+  /api/v1/catalog:
+    get:
+      tags: [Catalog]
+      summary: List currently bookable catalog products
+      description: |
+        Returns only products that are bookable for the supplied availability context and that
+        exactly match any `style` and `occasion` filters. Sellers are de-duplicated from the
+        returned products. An unsupported postcode or unavailable slot produces an empty list,
+        rather than returning non-bookable products.
+      operationId: listCatalogProducts
+      parameters:
+        - $ref: '#/components/parameters/CatalogDate'
+        - $ref: '#/components/parameters/CatalogMethod'
+        - $ref: '#/components/parameters/CatalogPostcode'
+        - $ref: '#/components/parameters/BudgetCents'
+        - $ref: '#/components/parameters/BudgetDollars'
+        - $ref: '#/components/parameters/Style'
+        - $ref: '#/components/parameters/Occasion'
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: Bookable products, their sellers, and the normalized query context.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogResponse'
+        '400':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+        default:
+          $ref: '#/components/responses/ErrorResponse'
+
+  /api/v1/products/{slug}:
+    get:
+      tags: [Catalog]
+      summary: Get product detail and availability
+      description: |
+        Looks up a product by its public slug. Unlike the catalog list, the product is returned
+        even when it is not bookable; inspect `product.availability` for the current result.
+      operationId: getProductDetail
+      parameters:
+        - $ref: '#/components/parameters/ProductSlug'
+        - $ref: '#/components/parameters/CatalogDate'
+        - $ref: '#/components/parameters/CatalogMethod'
+        - $ref: '#/components/parameters/CatalogPostcode'
+        - $ref: '#/components/parameters/BudgetCents'
+        - $ref: '#/components/parameters/BudgetDollars'
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: Product detail with availability and checkout policy text.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductDetailResponse'
+        '400':
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+        default:
+          $ref: '#/components/responses/ErrorResponse'
+
+    patch:
+      tags: [Seller]
+      summary: Publish or pause a demo-seller product
+      description: |
+        Updates a product belonging to the fixed main demo seller. Despite the route placeholder
+        being named `slug`, this operation treats the path value as the internal product ID (for
+        example `product-blush-peony`). Archived products cannot be updated. When both request
+        fields are supplied, `status` takes precedence over `published`.
+      operationId: updateProductStatus
+      parameters:
+        - $ref: '#/components/parameters/ProductIdInSlugPath'
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateProductStatusInput'
+            examples:
+              publish:
+                value:
+                  status: published
+              pauseCompatibilityForm:
+                value:
+                  published: false
+      responses:
+        '200':
+          description: Updated demo-seller product.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductStatusResponse'
+        '400':
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+        '422':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+        default:
+          $ref: '#/components/responses/ErrorResponse'
+
+  /api/v1/orders:
+    post:
+      tags: [Orders]
+      summary: Create a demo order
+      description: |
+        Rechecks availability, atomically reserves capacity, creates an order, records an event,
+        and inserts a system message. Payment authorisation is simulated. Supply an
+        `Idempotency-Key` to make retries return the originally created order. If omitted, the
+        server generates a one-use key, so a client retry can create another order.
+      operationId: createOrder
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderInput'
+            example:
+              productSlug: blush-peony-study
+              requestedDate: '2026-07-16'
+              fulfilmentMethod: delivery
+              postcode: '160042'
+              quantity: 1
+              buyer:
+                name: Mei Lin Tan
+                email: mei@example.com
+              recipient:
+                name: Aisha
+                phone: '+65 8123 4567'
+                address: 42 Tiong Bahru Road, Singapore 160042
+              giftMessage: Thinking of you.
+              deliveryInstructions: Please call on arrival.
+      responses:
+        '201':
+          description: |
+            Order created, or the existing order returned after an idempotent replay. The response
+            status is `201` in both cases.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderResponse'
+        '400':
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+        '409':
+          $ref: '#/components/responses/ErrorResponse'
+        '422':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+        default:
+          $ref: '#/components/responses/ErrorResponse'
+
+  /api/v1/orders/{id}:
+    get:
+      tags: [Orders]
+      summary: Get an order, timeline, and conversation
+      description: Accepts either the internal order UUID or the public order number.
+      operationId: getOrder
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: Full buyer-visible order bundle, oldest events and messages first.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderBundleResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+        default:
+          $ref: '#/components/responses/ErrorResponse'
+
+    patch:
+      tags: [Orders]
+      summary: Apply the next seller order transition
+      description: |
+        Applies a seller-owned state transition when it appears in `order.allowedActions`, records
+        the event and a system message, and returns the refreshed order bundle. Accept and decline
+        update reserved capacity and simulate payment capture or voiding. Fulfilment makes the
+        simulated payout available. A decline requires a reason.
+
+        Supply an `Idempotency-Key` for safe retries. Keys should be globally unique within this
+        demo database; a replay returns the current bundle without applying the transition again.
+      operationId: transitionOrder
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransitionOrderInput'
+            examples:
+              accept:
+                value:
+                  action: accept
+              decline:
+                value:
+                  action: decline
+                  reason: Requested stem is unavailable.
+      responses:
+        '200':
+          description: Refreshed order bundle after the transition or an idempotent replay.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderBundleResponse'
+        '400':
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+        '409':
+          $ref: '#/components/responses/ErrorResponse'
+        '422':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+        default:
+          $ref: '#/components/responses/ErrorResponse'
+
+  /api/v1/orders/{id}/messages:
+    post:
+      tags: [Orders]
+      summary: Add a message to an order
+      description: |
+        Adds a buyer, seller, or support message to the order conversation. The default role is
+        `buyer`, and the sender name defaults to the order buyer, florist trading name, or
+        `Platform support` according to the role. Supply an `Idempotency-Key` for safe retries;
+        keys should be globally unique within the demo database.
+      operationId: addOrderMessage
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateMessageInput'
+            example:
+              senderRole: buyer
+              senderName: Mei Lin Tan
+              body: Could you leave the bouquet with reception?
+      responses:
+        '201':
+          description: Message created, or the original message returned after an idempotent replay.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageResponse'
+        '400':
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+        '422':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+        default:
+          $ref: '#/components/responses/ErrorResponse'
+
+  /api/v1/seller/dashboard:
+    get:
+      tags: [Seller]
+      summary: Get the main demo seller dashboard
+      description: |
+        Returns orders, products, capacity from the current local day through seven days ahead,
+        and operating metrics for the fixed `seller-petal-poem` demo seller. This endpoint is
+        unauthenticated in the MVP.
+      operationId: getSellerDashboard
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: Main demo seller dashboard snapshot.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SellerDashboardResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+        default:
+          $ref: '#/components/responses/ErrorResponse'
+
+  /api/v1/seller/settings:
+    patch:
+      tags: [Seller]
+      summary: Update main demo seller availability settings
+      description: |
+        Updates the fixed main demo seller. `acceptingNewOrders` takes precedence when supplied;
+        otherwise `paused` is inverted to derive it. Accepting orders clears `pausedUntil` and
+        sets the seller status to `active`; not accepting sets the status to `paused`.
+      operationId: updateSellerSettings
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateSellerSettingsInput'
+            examples:
+              resume:
+                value:
+                  acceptingNewOrders: true
+              pause:
+                value:
+                  paused: true
+                  pausedUntil: '2026-07-20T00:00:00.000Z'
+      responses:
+        '200':
+          description: Updated main demo seller settings.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SellerSettingsResponse'
+        '400':
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+        '422':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+        default:
+          $ref: '#/components/responses/ErrorResponse'
+
+  /api/v1/admin/dashboard:
+    get:
+      tags: [Admin]
+      summary: Get the demo marketplace operations dashboard
+      description: |
+        Returns marketplace metrics, seller-review rows, time-sensitive order exceptions, and the
+        twelve most recent order events. This endpoint is unauthenticated and read-only in the MVP.
+      operationId: getAdminDashboard
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: Demo marketplace operational snapshot.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminDashboardResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+        default:
+          $ref: '#/components/responses/ErrorResponse'
+
+components:
+  parameters:
+    CatalogDate:
+      name: date
+      in: query
+      required: false
+      description: |
+        Requested local fulfilment date in Singapore. Defaults at runtime to three local calendar
+        days after the request.
+      schema:
+        type: string
+        format: date
+      example: '2026-07-16'
+
+    CatalogMethod:
+      name: method
+      in: query
+      required: false
+      description: Fulfilment method. Defaults to `delivery` and is normalized to lowercase.
+      schema:
+        $ref: '#/components/schemas/FulfilmentMethod'
+        default: delivery
+
+    CatalogPostcode:
+      name: postcode
+      in: query
+      required: false
+      description: |
+        Singapore delivery postcode. Spaces are removed. Defaults to `160042` for delivery and is
+        ignored for pickup. A non-six-digit value is treated as unavailable rather than malformed.
+      schema:
+        type: string
+      example: '160042'
+
+    BudgetCents:
+      name: budgetCents
+      in: query
+      required: false
+      description: Maximum total price in SGD cents, including the delivery fee. Takes precedence over `budget`.
+      schema:
+        type: number
+        minimum: 0
+      example: 12000
+
+    BudgetDollars:
+      name: budget
+      in: query
+      required: false
+      description: Maximum total price in SGD dollars, used only when `budgetCents` is absent.
+      schema:
+        type: number
+        minimum: 0
+      example: 120
+
+    Style:
+      name: style
+      in: query
+      required: false
+      description: Case-insensitive exact match against a product style tag.
+      schema:
+        type: string
+      example: romantic
+
+    Occasion:
+      name: occasion
+      in: query
+      required: false
+      description: Case-insensitive exact match against a product occasion tag.
+      schema:
+        type: string
+      example: birthday
+
+    ProductSlug:
+      name: slug
+      in: path
+      required: true
+      description: Public catalog product slug.
+      schema:
+        type: string
+        minLength: 1
+      example: blush-peony-study
+
+    ProductIdInSlugPath:
+      name: slug
+      in: path
+      required: true
+      description: Internal product ID for this PATCH operation; it is not a public slug.
+      schema:
+        type: string
+        minLength: 1
+      example: product-blush-peony
+
+    OrderId:
+      name: id
+      in: path
+      required: true
+      description: Internal order UUID or public order number.
+      schema:
+        type: string
+        minLength: 1
+      examples:
+        orderNumber:
+          value: FL-260713-1042
+        internalId:
+          value: 9d809f15-f2da-44ee-9a91-7cd6cbf6ab38
+
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Caller-generated retry key. Reusing a key returns the existing result without repeating
+        the write. Keys should be globally unique across commands in this demo database. When the
+        header is absent or blank, the server generates a new key and client retries are not
+        idempotent.
+      schema:
+        type: string
+        minLength: 1
+      example: 42c2fb07-8a18-43ae-a008-order-create-1
+
+    CorrelationId:
+      name: X-Correlation-Id
+      in: header
+      required: false
+      description: |
+        Client correlation value copied into `error.correlationId` when the request fails. A UUID
+        is generated for an error response when this header is absent.
+      schema:
+        type: string
+        minLength: 1
+
+  headers:
+    NoStore:
+      description: Successful read responses are not cacheable.
+      schema:
+        type: string
+        const: no-store
+
+  responses:
+    ErrorResponse:
+      description: |
+        Stable API error envelope. The HTTP status and `error.code` identify the failure; consult
+        `fieldErrors`, `recovery`, and `retryable` when present.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiErrorEnvelope'
+          examples:
+            validation:
+              value:
+                error:
+                  code: VALIDATION_FAILED
+                  message: Some checkout details need attention.
+                  correlationId: 73451234-432e-4d41-bfb1-521f95807ae9
+                  retryable: false
+                  fieldErrors:
+                    buyer.email: Enter a valid buyer email.
+                demoMode: true
+            conflict:
+              value:
+                error:
+                  code: CAPACITY_FULL
+                  message: The final capacity unit was just reserved by another buyer.
+                  correlationId: 8884d6e6-caf8-40b6-b733-b3a421af2eaf
+                  retryable: true
+                  recovery: Refresh availability and choose another date or florist.
+                demoMode: true
+
+  schemas:
+    DemoMode:
+      type: boolean
+      const: true
+      description: Always true in this implementation.
+
+    Currency:
+      type: string
+      const: SGD
+
+    MarketTimezone:
+      type: string
+      const: Asia/Singapore
+
+    Timestamp:
+      type: string
+      format: date-time
+
+    LocalDate:
+      type: string
+      format: date
+
+    NonNegativeInteger:
+      type: integer
+      minimum: 0
+
+    FulfilmentMethod:
+      type: string
+      enum: [pickup, delivery]
+
+    SellerStatus:
+      type: string
+      enum: [pending_review, active, paused, restricted, suspended]
+
+    ProductStatus:
+      type: string
+      enum: [draft, published, paused, archived]
+
+    OperationalStatus:
+      type: string
+      enum:
+        - awaiting_acceptance
+        - accepted
+        - preparing
+        - ready
+        - out_for_delivery
+        - delivered
+        - fulfilled
+        - declined
+
+    CommercialStatus:
+      type: string
+      enum: [awaiting_seller, confirmed, declined, completed]
+
+    PaymentStatus:
+      type: string
+      enum: [authorised, captured, voided]
+      description: Simulated payment state; no real processor is called.
+
+    PayoutStatus:
+      type: string
+      enum: [not_started, payout_pending, payout_available, paid, voided]
+      description: Simulated payout state; no real settlement is initiated.
+
+    OrderAction:
+      type: string
+      enum: [accept, decline, preparing, ready, out_for_delivery, delivered, fulfilled]
+
+    AvailabilityReason:
+      type: string
+      enum:
+        - SELLER_NOT_ACTIVE
+        - SELLER_PAUSED
+        - PRODUCT_NOT_PUBLISHED
+        - METHOD_DISABLED
+        - DATE_REQUIRED
+        - DATE_IN_PAST
+        - LEAD_TIME_NOT_MET
+        - POSTCODE_REQUIRED
+        - POSTCODE_UNSUPPORTED
+        - CAPACITY_FULL
+        - SLOT_UNAVAILABLE
+        - OVER_BUDGET
+
+    SellerSummary:
+      type: object
+      required:
+        - id
+        - slug
+        - tradingName
+        - sellerType
+        - verificationStatus
+        - status
+        - publicArea
+        - publicStory
+        - styleTags
+        - methods
+        - rating
+        - reviewCount
+        - acceptingNewOrders
+      properties:
+        id:
+          type: string
+        slug:
+          type: string
+        tradingName:
+          type: string
+        sellerType:
+          type: string
+          enum: [home, studio, store]
+        verificationStatus:
+          type: string
+          enum: [pending, verified, needs_information]
+        status:
+          $ref: '#/components/schemas/SellerStatus'
+        publicArea:
+          type: string
+          description: Coarse public location safe to expose for every seller.
+        publicAddress:
+          type: string
+          description: Present only for approved non-home public premises; never exposed for a home seller.
+        publicStory:
+          type: string
+        styleTags:
+          type: array
+          items:
+            type: string
+        methods:
+          type: array
+          items:
+            $ref: '#/components/schemas/FulfilmentMethod'
+        rating:
+          type: number
+          minimum: 0
+        reviewCount:
+          $ref: '#/components/schemas/NonNegativeInteger'
+        acceptingNewOrders:
+          type: boolean
+        pausedUntil:
+          type: string
+          description: Stored seller pause marker; the current settings command does not validate its format.
+
+    SellerAccount:
+      allOf:
+        - $ref: '#/components/schemas/SellerSummary'
+        - type: object
+          required:
+            - pspReady
+            - gstRegistered
+            - commissionBps
+            - responseSlaMinutes
+            - defaultLeadTimeHours
+            - timezone
+          properties:
+            pspReady:
+              type: boolean
+              description: Demo PSP readiness flag; it does not represent a live provider connection.
+            gstRegistered:
+              type: boolean
+            commissionBps:
+              $ref: '#/components/schemas/NonNegativeInteger'
+            responseSlaMinutes:
+              $ref: '#/components/schemas/NonNegativeInteger'
+            defaultLeadTimeHours:
+              $ref: '#/components/schemas/NonNegativeInteger'
+            timezone:
+              $ref: '#/components/schemas/MarketTimezone'
+
+    CatalogContext:
+      type: object
+      required: [requestedDate, method, timezone, queriedAt]
+      properties:
+        requestedDate:
+          $ref: '#/components/schemas/LocalDate'
+        method:
+          $ref: '#/components/schemas/FulfilmentMethod'
+        postcode:
+          type: string
+        budgetMaxCents:
+          $ref: '#/components/schemas/NonNegativeInteger'
+        style:
+          type: string
+        occasion:
+          type: string
+        timezone:
+          $ref: '#/components/schemas/MarketTimezone'
+        queriedAt:
+          $ref: '#/components/schemas/Timestamp'
+
+    AvailabilityResult:
+      type: object
+      required:
+        - bookable
+        - reasons
+        - requestedDate
+        - method
+        - deliveryFeeCents
+        - totalCents
+        - remainingCapacity
+        - publicArea
+        - confirmationMinutes
+      properties:
+        bookable:
+          type: boolean
+        reasons:
+          type: array
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/AvailabilityReason'
+        requestedDate:
+          $ref: '#/components/schemas/LocalDate'
+        method:
+          $ref: '#/components/schemas/FulfilmentMethod'
+        window:
+          type: string
+        deliveryFeeCents:
+          $ref: '#/components/schemas/NonNegativeInteger'
+        totalCents:
+          $ref: '#/components/schemas/NonNegativeInteger'
+        remainingCapacity:
+          $ref: '#/components/schemas/NonNegativeInteger'
+        publicArea:
+          type: string
+        confirmationMinutes:
+          $ref: '#/components/schemas/NonNegativeInteger'
+
+    CatalogProduct:
+      type: object
+      required:
+        - id
+        - slug
+        - title
+        - description
+        - priceCents
+        - currency
+        - imageUrl
+        - imageAlt
+        - occasionTags
+        - styleTags
+        - flowerTags
+        - leadTimeHours
+        - methods
+        - seller
+        - availability
+      properties:
+        id:
+          type: string
+        slug:
+          type: string
+        title:
+          type: string
+        description:
+          type: string
+        priceCents:
+          $ref: '#/components/schemas/NonNegativeInteger'
+        currency:
+          $ref: '#/components/schemas/Currency'
+        imageUrl:
+          type: string
+        imageAlt:
+          type: string
+        occasionTags:
+          type: array
+          items:
+            type: string
+        styleTags:
+          type: array
+          items:
+            type: string
+        flowerTags:
+          type: array
+          items:
+            type: string
+        leadTimeHours:
+          $ref: '#/components/schemas/NonNegativeInteger'
+        methods:
+          type: array
+          items:
+            $ref: '#/components/schemas/FulfilmentMethod'
+        seller:
+          $ref: '#/components/schemas/SellerSummary'
+        availability:
+          $ref: '#/components/schemas/AvailabilityResult'
+
+    ProductPolicies:
+      type: object
+      required: [cancellation, substitution, freshness, sellerManagedDelivery]
+      properties:
+        cancellation:
+          type: string
+        substitution:
+          type: string
+        freshness:
+          type: string
+        sellerManagedDelivery:
+          type: string
+
+    ProductDetail:
+      allOf:
+        - $ref: '#/components/schemas/CatalogProduct'
+        - type: object
+          required: [representativePhotoDisclosure, dimensions, policies]
+          properties:
+            representativePhotoDisclosure:
+              type: string
+            dimensions:
+              type: string
+            policies:
+              $ref: '#/components/schemas/ProductPolicies'
+
+    MoneyBreakdown:
+      type: object
+      required:
+        - subtotalCents
+        - deliveryCents
+        - platformFeeCents
+        - taxCents
+        - totalCents
+        - commissionCents
+        - sellerNetCents
+        - currency
+      properties:
+        subtotalCents:
+          $ref: '#/components/schemas/NonNegativeInteger'
+        deliveryCents:
+          $ref: '#/components/schemas/NonNegativeInteger'
+        platformFeeCents:
+          $ref: '#/components/schemas/NonNegativeInteger'
+        taxCents:
+          $ref: '#/components/schemas/NonNegativeInteger'
+        totalCents:
+          $ref: '#/components/schemas/NonNegativeInteger'
+        commissionCents:
+          $ref: '#/components/schemas/NonNegativeInteger'
+        sellerNetCents:
+          $ref: '#/components/schemas/NonNegativeInteger'
+        currency:
+          $ref: '#/components/schemas/Currency'
+
+    ProductSnapshot:
+      type: object
+      required:
+        - productId
+        - slug
+        - title
+        - imageUrl
+        - quantity
+        - unitPriceCents
+        - sellerName
+        - representativePhotoDisclosure
+      properties:
+        productId:
+          type: string
+        slug:
+          type: string
+        title:
+          type: string
+        imageUrl:
+          type: string
+        quantity:
+          type: integer
+          minimum: 1
+        unitPriceCents:
+          $ref: '#/components/schemas/NonNegativeInteger'
+        sellerName:
+          type: string
+        representativePhotoDisclosure:
+          type: string
+
+    FeeSnapshot:
+      type: object
+      required: [deliveryFeeCents, commissionBps, gstRegistered, capturedAtCheckout]
+      properties:
+        deliveryZone:
+          type: string
+        deliveryFeeCents:
+          $ref: '#/components/schemas/NonNegativeInteger'
+        commissionBps:
+          $ref: '#/components/schemas/NonNegativeInteger'
+        gstRegistered:
+          type: boolean
+        capturedAtCheckout:
+          $ref: '#/components/schemas/Timestamp'
+
+    NextAction:
+      type: object
+      required: [owner, label]
+      properties:
+        owner:
+          type: string
+          enum: [buyer, seller, none]
+        label:
+          type: string
+        deadline:
+          $ref: '#/components/schemas/Timestamp'
+
+    OrderView:
+      type: object
+      required:
+        - id
+        - orderNumber
+        - seller
+        - commercialStatus
+        - operationalStatus
+        - paymentStatus
+        - payoutStatus
+        - fulfilmentMethod
+        - requestedDate
+        - timezone
+        - window
+        - confirmBy
+        - productSnapshot
+        - feeSnapshot
+        - totals
+        - nextAction
+        - allowedActions
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          type: string
+        orderNumber:
+          type: string
+          pattern: '^FL-[0-9]{6}-[A-Z0-9]{4,5}$'
+        seller:
+          $ref: '#/components/schemas/SellerSummary'
+        commercialStatus:
+          $ref: '#/components/schemas/CommercialStatus'
+        operationalStatus:
+          $ref: '#/components/schemas/OperationalStatus'
+        paymentStatus:
+          $ref: '#/components/schemas/PaymentStatus'
+        payoutStatus:
+          $ref: '#/components/schemas/PayoutStatus'
+        fulfilmentMethod:
+          $ref: '#/components/schemas/FulfilmentMethod'
+        requestedDate:
+          $ref: '#/components/schemas/LocalDate'
+        timezone:
+          $ref: '#/components/schemas/MarketTimezone'
+        window:
+          type: string
+        deliveryPostcode:
+          type: string
+        confirmBy:
+          $ref: '#/components/schemas/Timestamp'
+        confirmedAt:
+          $ref: '#/components/schemas/Timestamp'
+        completedAt:
+          $ref: '#/components/schemas/Timestamp'
+        productSnapshot:
+          $ref: '#/components/schemas/ProductSnapshot'
+        feeSnapshot:
+          $ref: '#/components/schemas/FeeSnapshot'
+        totals:
+          $ref: '#/components/schemas/MoneyBreakdown'
+        nextAction:
+          $ref: '#/components/schemas/NextAction'
+        allowedActions:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrderAction'
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+        updatedAt:
+          $ref: '#/components/schemas/Timestamp'
+
+    Buyer:
+      type: object
+      required: [name, email]
+      properties:
+        name:
+          type: string
+          minLength: 1
+        email:
+          type: string
+          format: email
+
+    Recipient:
+      type: object
+      properties:
+        name:
+          type: string
+        phone:
+          type: string
+        address:
+          type: string
+
+    OrderDetail:
+      allOf:
+        - $ref: '#/components/schemas/OrderView'
+        - type: object
+          required: [buyer, policies]
+          properties:
+            buyer:
+              $ref: '#/components/schemas/Buyer'
+            recipient:
+              $ref: '#/components/schemas/Recipient'
+            giftMessage:
+              type: string
+            deliveryInstructions:
+              type: string
+            policies:
+              $ref: '#/components/schemas/ProductPolicies'
+
+    OrderEvent:
+      type: object
+      required: [id, orderId, actorRole, eventType, metadata, createdAt]
+      properties:
+        id:
+          type: string
+        orderId:
+          type: string
+        actorRole:
+          type: string
+          enum: [buyer, seller, support, system]
+        eventType:
+          type: string
+        fromState:
+          type: string
+        toState:
+          type: string
+        reason:
+          type: string
+        metadata:
+          type: object
+          additionalProperties: true
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+
+    Message:
+      type: object
+      required: [id, orderId, senderRole, senderName, body, messageType, createdAt]
+      properties:
+        id:
+          type: string
+        orderId:
+          type: string
+        senderRole:
+          type: string
+          enum: [buyer, seller, support, system]
+        senderName:
+          type: string
+        body:
+          type: string
+        messageType:
+          type: string
+          enum: [message, system]
+        readAt:
+          $ref: '#/components/schemas/Timestamp'
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+
+    CreateOrderInput:
+      type: object
+      required: [requestedDate, fulfilmentMethod, buyer]
+      anyOf:
+        - required: [productId]
+        - required: [productSlug]
+      properties:
+        productId:
+          type: string
+          minLength: 1
+        productSlug:
+          type: string
+          minLength: 1
+        requestedDate:
+          $ref: '#/components/schemas/LocalDate'
+        fulfilmentMethod:
+          $ref: '#/components/schemas/FulfilmentMethod'
+        postcode:
+          type: string
+          description: Required for delivery after spaces are removed; must be six digits.
+        window:
+          type: string
+          description: Optional client-selected display label; availability still determines bookability.
+        quantity:
+          type: integer
+          minimum: 1
+          maximum: 10
+          default: 1
+        buyer:
+          $ref: '#/components/schemas/Buyer'
+        recipient:
+          $ref: '#/components/schemas/Recipient'
+        giftMessage:
+          type: string
+        deliveryInstructions:
+          type: string
+      allOf:
+        - if:
+            properties:
+              fulfilmentMethod:
+                const: delivery
+            required: [fulfilmentMethod]
+          then:
+            required: [postcode, recipient]
+            properties:
+              postcode:
+                type: string
+                pattern: '^\\s*[0-9](?:\\s*[0-9]){5}\\s*$'
+              recipient:
+                type: object
+                required: [address]
+                properties:
+                  address:
+                    type: string
+                    minLength: 1
+
+    TransitionOrderInput:
+      type: object
+      required: [action]
+      properties:
+        action:
+          $ref: '#/components/schemas/OrderAction'
+        reason:
+          type: string
+      allOf:
+        - if:
+            properties:
+              action:
+                const: decline
+            required: [action]
+          then:
+            required: [reason]
+            properties:
+              reason:
+                type: string
+                minLength: 1
+
+    CreateMessageInput:
+      type: object
+      required: [body]
+      properties:
+        senderRole:
+          type: string
+          enum: [buyer, seller, support]
+          default: buyer
+        senderName:
+          type: string
+          description: Optional display-name override; blank values use the role-specific default.
+        body:
+          type: string
+          minLength: 1
+          maxLength: 2000
+          description: Whitespace-only content is rejected after trimming.
+
+    UpdateProductStatusInput:
+      type: object
+      anyOf:
+        - required: [status]
+        - required: [published]
+      properties:
+        status:
+          type: string
+          enum: [published, paused]
+        published:
+          type: boolean
+          description: Compatibility form; true maps to published and false maps to paused.
+
+    UpdateSellerSettingsInput:
+      type: object
+      description: An empty object is accepted and preserves the current accepting-orders state.
+      properties:
+        acceptingNewOrders:
+          type: boolean
+        paused:
+          type: boolean
+          description: Used only when `acceptingNewOrders` is absent; it is inverted to derive that value.
+        pausedUntil:
+          type: [string, 'null']
+          description: Stored as supplied when pausing; null or blank clears the value.
+          examples:
+            - '2026-07-20T00:00:00.000Z'
+            - null
+
+    SellerProductBase:
+      type: object
+      required:
+        - id
+        - slug
+        - title
+        - status
+        - priceCents
+        - currency
+        - imageUrl
+        - imageAlt
+        - methods
+        - leadTimeHours
+        - updatedAt
+      properties:
+        id:
+          type: string
+        slug:
+          type: string
+        title:
+          type: string
+        status:
+          $ref: '#/components/schemas/ProductStatus'
+        priceCents:
+          $ref: '#/components/schemas/NonNegativeInteger'
+        currency:
+          $ref: '#/components/schemas/Currency'
+        imageUrl:
+          type: string
+        imageAlt:
+          type: string
+        methods:
+          type: array
+          items:
+            $ref: '#/components/schemas/FulfilmentMethod'
+        leadTimeHours:
+          $ref: '#/components/schemas/NonNegativeInteger'
+        updatedAt:
+          $ref: '#/components/schemas/Timestamp'
+
+    SellerDashboardProduct:
+      allOf:
+        - $ref: '#/components/schemas/SellerProductBase'
+        - type: object
+          required: [activeOrderCount]
+          properties:
+            activeOrderCount:
+              $ref: '#/components/schemas/NonNegativeInteger'
+
+    UpdatedSellerProduct:
+      allOf:
+        - $ref: '#/components/schemas/SellerProductBase'
+        - type: object
+          properties:
+            status:
+              type: string
+              enum: [published, paused]
+
+    CapacitySlot:
+      type: object
+      required: [id, date, method, window, total, reserved, committed, remaining]
+      properties:
+        id:
+          type: string
+        date:
+          $ref: '#/components/schemas/LocalDate'
+        method:
+          $ref: '#/components/schemas/FulfilmentMethod'
+        window:
+          type: string
+        total:
+          $ref: '#/components/schemas/NonNegativeInteger'
+        reserved:
+          $ref: '#/components/schemas/NonNegativeInteger'
+        committed:
+          $ref: '#/components/schemas/NonNegativeInteger'
+        remaining:
+          $ref: '#/components/schemas/NonNegativeInteger'
+
+    SellerMetrics:
+      type: object
+      required:
+        - awaitingAcceptance
+        - activeOrders
+        - dueToday
+        - unreadMessages
+        - payoutPendingCents
+        - currency
+      properties:
+        awaitingAcceptance:
+          $ref: '#/components/schemas/NonNegativeInteger'
+        activeOrders:
+          $ref: '#/components/schemas/NonNegativeInteger'
+        dueToday:
+          $ref: '#/components/schemas/NonNegativeInteger'
+        unreadMessages:
+          $ref: '#/components/schemas/NonNegativeInteger'
+        payoutPendingCents:
+          $ref: '#/components/schemas/NonNegativeInteger'
+        currency:
+          $ref: '#/components/schemas/Currency'
+
+    AdminMetrics:
+      type: object
+      required:
+        - activeSellers
+        - liveProducts
+        - openOrders
+        - authorisedGmvCents
+        - capturedGmvCents
+        - pendingPayoutCents
+        - currency
+      properties:
+        activeSellers:
+          $ref: '#/components/schemas/NonNegativeInteger'
+        liveProducts:
+          $ref: '#/components/schemas/NonNegativeInteger'
+        openOrders:
+          $ref: '#/components/schemas/NonNegativeInteger'
+        authorisedGmvCents:
+          $ref: '#/components/schemas/NonNegativeInteger'
+        capturedGmvCents:
+          $ref: '#/components/schemas/NonNegativeInteger'
+        pendingPayoutCents:
+          $ref: '#/components/schemas/NonNegativeInteger'
+        currency:
+          $ref: '#/components/schemas/Currency'
+
+    SellerReview:
+      type: object
+      required:
+        - id
+        - tradingName
+        - sellerType
+        - publicArea
+        - uenStatus
+        - verificationStatus
+        - pspReady
+        - storefrontStatus
+        - approvalState
+        - riskFlags
+        - nextAction
+        - submittedAt
+      properties:
+        id:
+          type: string
+        tradingName:
+          type: string
+        sellerType:
+          type: string
+          enum: [home, studio, store]
+        publicArea:
+          type: string
+        uenStatus:
+          type: string
+          enum: [provided, review_required]
+        verificationStatus:
+          type: string
+          enum: [pending, verified, needs_information]
+        pspReady:
+          type: boolean
+        storefrontStatus:
+          $ref: '#/components/schemas/SellerStatus'
+        approvalState:
+          type: string
+          enum: [approved, renewal_review]
+        riskFlags:
+          type: array
+          items:
+            type: string
+        nextAction:
+          type: string
+        submittedAt:
+          $ref: '#/components/schemas/Timestamp'
+
+    AdminException:
+      type: object
+      required:
+        - id
+        - orderId
+        - orderNumber
+        - sellerName
+        - type
+        - severity
+        - status
+        - owner
+        - deadline
+        - summary
+        - paymentStatus
+        - updatedAt
+      properties:
+        id:
+          type: string
+        orderId:
+          type: string
+        orderNumber:
+          type: string
+        sellerName:
+          type: string
+        type:
+          type: string
+          enum: [acceptance_deadline, fulfilment_due]
+        severity:
+          type: string
+          enum: [high, medium, low]
+        status:
+          type: string
+          const: open
+        owner:
+          type: string
+          enum: [seller_success, support]
+        deadline:
+          description: ISO timestamp for acceptance risk, or local date for fulfilment risk.
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - $ref: '#/components/schemas/LocalDate'
+        summary:
+          type: string
+        paymentStatus:
+          $ref: '#/components/schemas/PaymentStatus'
+        updatedAt:
+          $ref: '#/components/schemas/Timestamp'
+
+    AdminRecentEvent:
+      type: object
+      required: [id, orderId, orderNumber, sellerName, actorRole, eventType, createdAt]
+      properties:
+        id:
+          type: string
+        orderId:
+          type: string
+        orderNumber:
+          type: string
+        sellerName:
+          type: string
+        actorRole:
+          type: string
+          enum: [buyer, seller, support, system]
+        eventType:
+          type: string
+        fromState:
+          type: string
+        toState:
+          type: string
+        reason:
+          type: string
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+
+    ApiErrorEnvelope:
+      type: object
+      required: [error, demoMode]
+      properties:
+        error:
+          type: object
+          required: [code, message, correlationId, retryable]
+          properties:
+            code:
+              type: string
+              description: Stable machine-readable code such as `INVALID_DATE` or `CAPACITY_FULL`.
+            message:
+              type: string
+            correlationId:
+              type: string
+            retryable:
+              type: boolean
+            fieldErrors:
+              type: object
+              additionalProperties:
+                type: string
+            recovery:
+              type: string
+        demoMode:
+          $ref: '#/components/schemas/DemoMode'
+
+    CatalogResponse:
+      type: object
+      required: [products, sellers, context, demoMode]
+      properties:
+        products:
+          type: array
+          items:
+            $ref: '#/components/schemas/CatalogProduct'
+        sellers:
+          type: array
+          items:
+            $ref: '#/components/schemas/SellerSummary'
+        context:
+          $ref: '#/components/schemas/CatalogContext'
+        demoMode:
+          $ref: '#/components/schemas/DemoMode'
+
+    ProductDetailResponse:
+      type: object
+      required: [product, demoMode]
+      properties:
+        product:
+          $ref: '#/components/schemas/ProductDetail'
+        demoMode:
+          $ref: '#/components/schemas/DemoMode'
+
+    ProductStatusResponse:
+      type: object
+      required: [product, demoMode]
+      properties:
+        product:
+          $ref: '#/components/schemas/UpdatedSellerProduct'
+        demoMode:
+          $ref: '#/components/schemas/DemoMode'
+
+    OrderResponse:
+      type: object
+      required: [order, demoMode]
+      properties:
+        order:
+          $ref: '#/components/schemas/OrderDetail'
+        demoMode:
+          $ref: '#/components/schemas/DemoMode'
+
+    OrderBundleResponse:
+      type: object
+      required: [order, events, messages, demoMode]
+      properties:
+        order:
+          $ref: '#/components/schemas/OrderDetail'
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrderEvent'
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/Message'
+        demoMode:
+          $ref: '#/components/schemas/DemoMode'
+
+    MessageResponse:
+      type: object
+      required: [message, demoMode]
+      properties:
+        message:
+          $ref: '#/components/schemas/Message'
+        demoMode:
+          $ref: '#/components/schemas/DemoMode'
+
+    SellerSettingsResponse:
+      type: object
+      required: [seller, demoMode]
+      properties:
+        seller:
+          $ref: '#/components/schemas/SellerAccount'
+        demoMode:
+          $ref: '#/components/schemas/DemoMode'
+
+    SellerDashboardResponse:
+      type: object
+      required: [seller, orders, products, metrics, capacity, demoMode]
+      properties:
+        seller:
+          $ref: '#/components/schemas/SellerAccount'
+        orders:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrderView'
+        products:
+          type: array
+          items:
+            $ref: '#/components/schemas/SellerDashboardProduct'
+        metrics:
+          $ref: '#/components/schemas/SellerMetrics'
+        capacity:
+          type: array
+          items:
+            $ref: '#/components/schemas/CapacitySlot'
+        demoMode:
+          $ref: '#/components/schemas/DemoMode'
+
+    AdminDashboardResponse:
+      type: object
+      required: [metrics, sellerReviews, exceptions, recentEvents, demoMode]
+      properties:
+        metrics:
+          $ref: '#/components/schemas/AdminMetrics'
+        sellerReviews:
+          type: array
+          items:
+            $ref: '#/components/schemas/SellerReview'
+        exceptions:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminException'
+        recentEvents:
+          type: array
+          maxItems: 12
+          items:
+            $ref: '#/components/schemas/AdminRecentEvent'
+        demoMode:
+          $ref: '#/components/schemas/DemoMode'
