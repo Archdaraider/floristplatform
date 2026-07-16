@@ -46,7 +46,11 @@ paths:
       summary: List currently bookable catalog products
       description: |
         Returns only products that are bookable for the supplied availability context and that
-        exactly match any `style` and `occasion` filters. Sellers are de-duplicated from the
+        exactly match any explicit `style` and `occasion` filters. An optional typo-tolerant `q`
+        is interpreted as flowers, occasion, style, colour, wrapping, and budget intent. Exact
+        smart-search matches are preferred; if none are bookable, the response labels and returns
+        the closest bookable products. The deterministic parser remains available when an AI
+        provider is unconfigured, unavailable, or over quota. Sellers are de-duplicated from the
         returned products. When delivery zones overlap, exactly one postcode-matching zone is
         selected deterministically by fee, name, and zone ID. Expired reservations are reconciled before
         availability is calculated. An unsupported postcode or unavailable slot produces an
@@ -60,6 +64,7 @@ paths:
         - $ref: '#/components/parameters/BudgetDollars'
         - $ref: '#/components/parameters/Style'
         - $ref: '#/components/parameters/Occasion'
+        - $ref: '#/components/parameters/SmartSearchQuery'
         - $ref: '#/components/parameters/CorrelationId'
       responses:
         '200':
@@ -117,13 +122,15 @@ paths:
       tags: [Seller]
       summary: Publish or pause a demo-seller product
       description: |
-        Updates a product belonging to the fixed main demo seller. Despite the route placeholder
+        Updates a product belonging to the selected demo seller. Despite the route placeholder
         being named `slug`, this operation treats the path value as the internal product ID (for
         example `product-blush-peony`). Archived products cannot be updated. When both request
-        fields are supplied, `status` takes precedence over `published`.
+        fields are supplied, `status` takes precedence over `published`. `sellerId` is a demo
+        workspace selector, not production authentication.
       operationId: updateProductStatus
       parameters:
         - $ref: '#/components/parameters/ProductIdInSlugPath'
+        - $ref: '#/components/parameters/DemoSellerId'
         - $ref: '#/components/parameters/CorrelationId'
       requestBody:
         required: true
@@ -240,68 +247,16 @@ paths:
         default:
           $ref: '#/components/responses/ErrorResponse'
 
-    patch:
-      tags: [Orders]
-      summary: Apply the next seller order transition
-      description: |
-        Applies a seller-owned state transition when it appears in `order.allowedActions`, records
-        the event and a system message, and returns the refreshed order bundle. Accept and decline
-        update reserved capacity and simulate payment capture or voiding. Fulfilment makes the
-        simulated payout available. A decline requires a reason.
-
-        Supply an `Idempotency-Key` for safe retries. Keys are scoped to the requested order; an
-        exact replay returns the current bundle without applying the transition again, while
-        reusing the key with a different action or reason returns `409 IDEMPOTENCY_CONFLICT`.
-      operationId: transitionOrder
-      parameters:
-        - $ref: '#/components/parameters/OrderId'
-        - $ref: '#/components/parameters/IdempotencyKey'
-        - $ref: '#/components/parameters/CorrelationId'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/TransitionOrderInput'
-            examples:
-              accept:
-                value:
-                  action: accept
-              decline:
-                value:
-                  action: decline
-                  reason: Requested stem is unavailable.
-      responses:
-        '200':
-          description: Refreshed order bundle after the transition or an idempotent replay.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/OrderBundleResponse'
-        '400':
-          $ref: '#/components/responses/ErrorResponse'
-        '404':
-          $ref: '#/components/responses/ErrorResponse'
-        '409':
-          $ref: '#/components/responses/ErrorResponse'
-        '422':
-          $ref: '#/components/responses/ErrorResponse'
-        '500':
-          $ref: '#/components/responses/ErrorResponse'
-        default:
-          $ref: '#/components/responses/ErrorResponse'
-
   /api/v1/orders/{id}/messages:
     post:
       tags: [Orders]
-      summary: Add a message to an order
+      summary: Add a buyer message to an order
       description: |
-        Adds a buyer, seller, or support message to the order conversation. The default role is
-        `buyer`, and the sender name defaults to the order buyer, florist trading name, or
-        `Platform support` according to the role. Supply an `Idempotency-Key` for safe retries.
-        Keys are scoped to the requested order; an exact replay returns the original message,
-        while reusing the key with a different message payload returns `409 IDEMPOTENCY_CONFLICT`.
-      operationId: addOrderMessage
+        Adds a buyer message to the order conversation. Role and sender name are derived from the
+        order server-side; caller-supplied identity fields are ignored. Supply an `Idempotency-Key`
+        for safe retries. Keys are scoped to the requested order; an exact replay returns the
+        original message, while a different body returns `409 IDEMPOTENCY_CONFLICT`.
+      operationId: addBuyerOrderMessage
       parameters:
         - $ref: '#/components/parameters/OrderId'
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -311,10 +266,14 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/CreateMessageInput'
+              type: object
+              required: [body]
+              properties:
+                body:
+                  type: string
+                  minLength: 1
+                  maxLength: 2000
             example:
-              senderRole: buyer
-              senderName: Mei Lin Tan
               body: Could you leave the bouquet with reception?
       responses:
         '201':
@@ -339,17 +298,18 @@ paths:
   /api/v1/seller/dashboard:
     get:
       tags: [Seller]
-      summary: Get the main demo seller dashboard
+      summary: Get a demo seller dashboard
       description: |
         Returns orders, products, capacity from the current local day through seven days ahead,
-        and operating metrics for the fixed `seller-petal-poem` demo seller. This endpoint is
-        unauthenticated in the MVP.
+        per-order unread buyer counts, and operating metrics for the selected demo seller. The
+        optional `sellerId` query is a demo workspace selector and is not authentication.
       operationId: getSellerDashboard
       parameters:
+        - $ref: '#/components/parameters/DemoSellerId'
         - $ref: '#/components/parameters/CorrelationId'
       responses:
         '200':
-          description: Main demo seller dashboard snapshot.
+          description: Selected demo seller dashboard snapshot.
           headers:
             Cache-Control:
               $ref: '#/components/headers/NoStore'
@@ -364,18 +324,234 @@ paths:
         default:
           $ref: '#/components/responses/ErrorResponse'
 
+  /api/v1/seller/orders/{id}:
+    get:
+      tags: [Seller]
+      summary: Get an owned order for a demo seller
+      description: |
+        Returns the full order bundle only when the order belongs to the selected demo seller.
+        The query selector models workspace ownership for the demo; production must derive seller
+        identity from authenticated server context.
+      operationId: getSellerOrderBundle
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/DemoSellerId'
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: Seller-owned order bundle.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/PrivateNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderBundleResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+        default:
+          $ref: '#/components/responses/ErrorResponse'
+    patch:
+      tags: [Seller]
+      summary: Transition a seller-owned order
+      description: Applies an allowed lifecycle action after checking demo seller ownership.
+      operationId: transitionSellerOrder
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/DemoSellerId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransitionOrderInput'
+      responses:
+        '200':
+          description: Refreshed seller-owned order bundle.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderBundleResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+        '409':
+          $ref: '#/components/responses/ErrorResponse'
+        '422':
+          $ref: '#/components/responses/ErrorResponse'
+        default:
+          $ref: '#/components/responses/ErrorResponse'
+
+  /api/v1/seller/orders/{id}/messages:
+    post:
+      tags: [Seller]
+      summary: Reply from the owning demo seller
+      description: |
+        Adds a seller message after ownership checking. Sender role and trading name are derived
+        server-side rather than accepted from the request body.
+      operationId: addSellerOrderMessage
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/DemoSellerId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [body]
+              properties:
+                body:
+                  type: string
+                  minLength: 1
+                  maxLength: 2000
+      responses:
+        '201':
+          description: Seller message created or replayed idempotently.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+        '409':
+          $ref: '#/components/responses/ErrorResponse'
+        '422':
+          $ref: '#/components/responses/ErrorResponse'
+        default:
+          $ref: '#/components/responses/ErrorResponse'
+
+  /api/v1/seller/orders/{id}/messages/read:
+    post:
+      tags: [Seller]
+      summary: Mark visible buyer messages as read
+      description: |
+        Marks unread buyer messages through the latest buyer message the seller has visibly opened.
+        Messages arriving later remain unread. Ownership is checked against the selected demo seller.
+      operationId: markSellerOrderMessagesRead
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/DemoSellerId'
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MarkSellerMessagesReadInput'
+      responses:
+        '200':
+          description: Read receipt result.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/PrivateNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MarkSellerMessagesReadResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+        '422':
+          $ref: '#/components/responses/ErrorResponse'
+        default:
+          $ref: '#/components/responses/ErrorResponse'
+
+  /api/v1/seller/orders/{id}/note:
+    get:
+      tags: [Seller]
+      summary: Get a private seller note for one order
+      description: |
+        Returns the selected demo seller's private working note for an owned order. The path
+        accepts an internal order ID or public order number. A note that has never been saved is
+        represented by an empty body at version `0`. This resource is deliberately separate from
+        the buyer-visible order bundle, dashboard summaries, messages, and events. The endpoint is
+        unauthenticated in the MVP and must not be used with real seller or recipient data.
+      operationId: getSellerOrderNote
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/DemoSellerId'
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: The current private seller note, including its optimistic-lock version.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/PrivateNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SellerOrderNoteResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+        default:
+          $ref: '#/components/responses/ErrorResponse'
+
+    put:
+      tags: [Seller]
+      summary: Replace a private seller note
+      description: |
+        Replaces the private working note after normalizing line endings and trimming outer
+        whitespace. Empty text clears the note. `expectedVersion` must match the version returned
+        by the latest GET or successful PUT. An exact stale replay succeeds without incrementing
+        the version; a stale request with different text returns
+        `409 SELLER_NOTE_VERSION_CONFLICT`, preventing silent overwrites between seller tabs.
+      operationId: updateSellerOrderNote
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/DemoSellerId'
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateSellerOrderNoteInput'
+            example:
+              body: Keep upright. Courier will use the side entrance.
+              expectedVersion: 2
+      responses:
+        '200':
+          description: The saved note, or the existing note after an exact retry.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/PrivateNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SellerOrderNoteResponse'
+        '400':
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+        '409':
+          $ref: '#/components/responses/ErrorResponse'
+        '422':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+        default:
+          $ref: '#/components/responses/ErrorResponse'
+
   /api/v1/seller/settings:
     patch:
       tags: [Seller]
-      summary: Update main demo seller availability settings
+      summary: Update demo seller availability settings
       description: |
-        Updates the fixed main demo seller. `acceptingNewOrders` takes precedence when supplied;
+        Updates the selected demo seller. `acceptingNewOrders` takes precedence when supplied;
         otherwise `paused` is inverted to derive it. For an active or paused seller, accepting
         orders clears `pausedUntil` and sets the status to `active`, while not accepting sets it
         to `paused`. Restricted and suspended statuses are preserved, and attempting to reopen
         intake for either returns `409 SELLER_RESTRICTED`.
       operationId: updateSellerSettings
       parameters:
+        - $ref: '#/components/parameters/DemoSellerId'
         - $ref: '#/components/parameters/CorrelationId'
       requestBody:
         required: true
@@ -508,6 +684,19 @@ components:
         type: string
       example: birthday
 
+    SmartSearchQuery:
+      name: q
+      in: query
+      required: false
+      description: |
+        Natural-language flower request. Spelling mistakes are tolerated and the text is mapped
+        only to validated catalogue facets; it is never used as SQL. Maximum 180 characters.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 180
+      example: Roses + daiseis fr anniversary black wrapper
+
     ProductSlug:
       name: slug
       in: path
@@ -527,6 +716,18 @@ components:
         type: string
         minLength: 1
       example: product-blush-peony
+
+    DemoSellerId:
+      name: sellerId
+      in: query
+      required: false
+      description: |
+        Demo workspace selector. Defaults to `seller-petal-poem`. This is not authentication;
+        production seller identity must come from a verified server-side session.
+      schema:
+        type: string
+        minLength: 1
+      example: seller-field-notes
 
     OrderId:
       name: id
@@ -574,6 +775,12 @@ components:
       schema:
         type: string
         const: no-store
+
+    PrivateNoStore:
+      description: Seller-private responses must not be cached by browsers or shared caches.
+      schema:
+        type: string
+        const: no-store, private
 
   responses:
     ErrorResponse:
@@ -793,6 +1000,9 @@ components:
           type: string
         occasion:
           type: string
+        query:
+          type: string
+          maxLength: 180
         timezone:
           $ref: '#/components/schemas/MarketTimezone'
         queriedAt:
@@ -1119,8 +1329,24 @@ components:
               type: string
             deliveryInstructions:
               type: string
+            pickupLocation:
+              type: string
+              description: Approved public collection point for a pickup order; never a home address.
             policies:
               $ref: '#/components/schemas/ProductPolicies'
+
+    SellerDashboardOrder:
+      allOf:
+        - $ref: '#/components/schemas/OrderView'
+        - type: object
+          required: [recipientName, unreadBuyerMessages]
+          properties:
+            recipientName:
+              type: string
+            unreadBuyerMessages:
+              $ref: '#/components/schemas/NonNegativeInteger'
+            lastBuyerMessageAt:
+              $ref: '#/components/schemas/Timestamp'
 
     OrderEvent:
       type: object
@@ -1254,24 +1480,6 @@ components:
                 type: string
                 minLength: 1
 
-    CreateMessageInput:
-      type: object
-      required: [body]
-      properties:
-        senderRole:
-          type: string
-          enum: [buyer, seller, support]
-          default: buyer
-        senderName:
-          type: string
-          maxLength: 120
-          description: Optional display-name override; blank values use the role-specific default.
-        body:
-          type: string
-          minLength: 1
-          maxLength: 2000
-          description: Whitespace-only content is rejected after trimming.
-
     UpdateProductStatusInput:
       type: object
       anyOf:
@@ -1306,6 +1514,61 @@ components:
           examples:
             - '2026-07-20T00:00:00.000Z'
             - null
+
+    SellerOrderNote:
+      type: object
+      required: [orderId, body, version, createdAt, updatedAt]
+      properties:
+        orderId:
+          type: string
+        body:
+          type: string
+          maxLength: 5000
+          description: Private seller working text. It is never included in the buyer order bundle.
+        version:
+          type: integer
+          minimum: 0
+          description: Version 0 represents a note that has not been saved yet.
+        createdAt:
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+        updatedAt:
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+
+    UpdateSellerOrderNoteInput:
+      type: object
+      required: [body, expectedVersion]
+      properties:
+        body:
+          type: string
+          maxLength: 5000
+          description: Empty or whitespace-only text clears the saved note.
+        expectedVersion:
+          type: integer
+          minimum: 0
+
+    MarkSellerMessagesReadInput:
+      type: object
+      properties:
+        throughMessageId:
+          type: string
+          description: Latest buyer message visibly rendered in the seller thread.
+
+    MarkSellerMessagesReadResponse:
+      type: object
+      required: [orderId, markedCount, readAt, demoMode]
+      properties:
+        orderId:
+          type: string
+        markedCount:
+          $ref: '#/components/schemas/NonNegativeInteger'
+        readAt:
+          $ref: '#/components/schemas/Timestamp'
+        demoMode:
+          $ref: '#/components/schemas/DemoMode'
 
     SellerProductBase:
       type: object
@@ -1596,8 +1859,43 @@ components:
             $ref: '#/components/schemas/SellerSummary'
         context:
           $ref: '#/components/schemas/CatalogContext'
+        search:
+          $ref: '#/components/schemas/SmartSearchSummary'
         demoMode:
           $ref: '#/components/schemas/DemoMode'
+
+    SmartSearchSummary:
+      type: object
+      required:
+        - query
+        - correctedQuery
+        - engine
+        - exact
+        - labels
+        - matchedLabels
+        - missingLabels
+      properties:
+        query:
+          type: string
+          maxLength: 180
+        correctedQuery:
+          type: string
+        engine:
+          type: string
+          enum: [local, workers-ai, groq]
+        exact:
+          type: boolean
+        labels:
+          type: array
+          items: { type: string }
+        matchedLabels:
+          type: array
+          items: { type: string }
+        missingLabels:
+          type: array
+          items: { type: string }
+        appliedBudgetMaxCents:
+          $ref: '#/components/schemas/NonNegativeInteger'
 
     ProductDetailResponse:
       type: object
@@ -1661,6 +1959,15 @@ components:
         demoMode:
           $ref: '#/components/schemas/DemoMode'
 
+    SellerOrderNoteResponse:
+      type: object
+      required: [note, demoMode]
+      properties:
+        note:
+          $ref: '#/components/schemas/SellerOrderNote'
+        demoMode:
+          $ref: '#/components/schemas/DemoMode'
+
     SellerDashboardResponse:
       type: object
       required: [seller, orders, products, metrics, capacity, demoMode]
@@ -1670,7 +1977,7 @@ components:
         orders:
           type: array
           items:
-            $ref: '#/components/schemas/OrderView'
+            $ref: '#/components/schemas/SellerDashboardOrder'
         products:
           type: array
           items:

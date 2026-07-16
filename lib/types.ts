@@ -63,6 +63,7 @@ export interface CatalogContext {
   budgetMaxCents?: number;
   style?: string;
   occasion?: string;
+  query?: string;
   timezone: typeof MARKET_TIMEZONE;
   queriedAt: string;
 }
@@ -190,9 +191,15 @@ export interface OrderView {
 export interface OrderDetail extends OrderView {
   buyer: { name: string; email: string };
   recipient?: { name?: string; phone?: string; address?: string };
+  /** Approved public collection point for pickup orders. Home addresses are never projected. */
+  pickupLocation?: string;
   giftMessage?: string;
   deliveryInstructions?: string;
   policies: ProductDetail["policies"];
+}
+
+export interface SellerOrderSummary extends OrderView {
+  recipientName: string;
 }
 
 export interface OrderEventView {

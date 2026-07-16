@@ -28,6 +28,14 @@ export type Product = {
   reviewCount?: number;
   stemCount?: string;
   includedItems?: string[];
+  dimensions?: string;
+  representativePhotoDisclosure?: string;
+  policies?: {
+    cancellation?: string;
+    substitution?: string;
+    freshness?: string;
+    sellerManagedDelivery?: string;
+  };
   status?: "published" | "paused";
   representativePhoto?: boolean;
 };
@@ -41,6 +49,9 @@ export type Seller = {
   verified: boolean;
   acceptingOrders?: boolean;
   story?: string;
+  publicAddress?: string;
+  fulfilmentMethods?: FulfilmentMethod[];
+  defaultLeadTimeHours?: number;
 };
 
 export type OrderEvent = {
@@ -81,6 +92,7 @@ export type Order = {
   addressLine?: string;
   deliveryInstructions?: string;
   publicPickupArea?: string;
+  pickupLocation?: string | null;
   privatePickupInstructions?: string | null;
   cardMessage?: string;
   substitutionPreference?: string;
@@ -102,6 +114,8 @@ export type Order = {
   createdAt: string;
   events?: OrderEvent[];
   messages?: Message[];
+  unreadBuyerMessages?: number;
+  lastBuyerMessageAt?: string;
 };
 
 export type SellerDashboard = {
@@ -112,6 +126,7 @@ export type SellerDashboard = {
   metrics?: {
     awaitingAcceptance?: number;
     dueToday?: number;
+    unreadMessages?: number;
     capacityUsed?: number;
     capacityTotal?: number;
     payoutPendingCents?: number;
@@ -146,5 +161,7 @@ export function formatSingaporeDate(date: string, includeTime = false) {
 
 export function humanizeStatus(value?: string) {
   if (!value) return "Not started";
-  return value.replaceAll("_", " ").replace(/^./, (letter) => letter.toUpperCase());
+  return value
+    .replace(/[._-]+/g, " ")
+    .replace(/^./, (letter) => letter.toUpperCase());
 }

@@ -2,6 +2,11 @@ import { ensureDemoDatabase } from "../db/bootstrap";
 import { ApiError } from "./api";
 import { reconcileExpiredOrders } from "./order-expiry";
 import {
+  MAX_SMART_SEARCH_LENGTH,
+  rankSmartSearch,
+  type SmartSearchIntent,
+} from "./smart-search";
+import {
   DEMO_MODE,
   MARKET_CURRENCY,
   MARKET_TIMEZONE,
@@ -188,6 +193,16 @@ export function parseCatalogContext(url: URL): CatalogContext {
     methodRaw === "delivery"
       ? url.searchParams.get("postcode")?.replace(/\s/g, "") || "160042"
       : undefined;
+  const query = url.searchParams.get("q")?.trim();
+  if (query && query.length > MAX_SMART_SEARCH_LENGTH) {
+    throw new ApiError(
+      "SEARCH_QUERY_TOO_LONG",
+      `Search descriptions must be ${MAX_SMART_SEARCH_LENGTH} characters or fewer.`,
+      400,
+      false,
+      { q: `Use ${MAX_SMART_SEARCH_LENGTH} characters or fewer.` },
+    );
+  }
 
   return {
     requestedDate,
@@ -200,6 +215,7 @@ export function parseCatalogContext(url: URL): CatalogContext {
     ...(url.searchParams.get("occasion")?.trim()
       ? { occasion: url.searchParams.get("occasion")!.trim() }
       : {}),
+    ...(query ? { query } : {}),
     timezone: MARKET_TIMEZONE,
     queriedAt: nowIso(),
   };
@@ -370,29 +386,51 @@ function matchesFilter(product: CatalogProduct, context: CatalogContext) {
   );
 }
 
-export async function catalog(context: CatalogContext) {
+export async function catalog(context: CatalogContext, searchIntent?: SmartSearchIntent) {
   await reconcileExpiredOrders();
+  const effectiveContext = searchIntent?.budgetMaxCents
+    ? {
+        ...context,
+        budgetMaxCents: Math.min(
+          context.budgetMaxCents ?? searchIntent.budgetMaxCents,
+          searchIntent.budgetMaxCents,
+        ),
+      }
+    : context;
   const database = await ensureDemoDatabase();
   const result = await database
     .prepare(`${MARKETPLACE_SELECT} ORDER BY p.base_price_cents ASC`)
-    .bind(context.requestedDate, context.method)
+    .bind(effectiveContext.requestedDate, effectiveContext.method)
     .all<MarketplaceRow>();
   const groupedRows = new Map<string, MarketplaceRow[]>();
   for (const row of result.results) {
     groupedRows.set(row.product_id, [...(groupedRows.get(row.product_id) ?? []), row]);
   }
   const allProducts = Array.from(groupedRows.values())
-    .map((rows) => chooseMarketplaceRow(rows, context))
+    .map((rows) => chooseMarketplaceRow(rows, effectiveContext))
     .filter((row): row is MarketplaceRow => Boolean(row))
-    .map((row) => mapCatalogProduct(row, context));
-  const products = allProducts.filter(
+    .map((row) => mapCatalogProduct(row, effectiveContext));
+  const bookableProducts = allProducts.filter(
     (product) => product.availability.bookable && matchesFilter(product, context)
   );
+  const ranked = searchIntent
+    ? rankSmartSearch(bookableProducts, searchIntent)
+    : { products: bookableProducts, search: undefined };
+  const products = ranked.products;
+  const search = ranked.search && searchIntent?.budgetMaxCents
+    ? { ...ranked.search, appliedBudgetMaxCents: effectiveContext.budgetMaxCents }
+    : ranked.search;
   const sellers = Array.from(
     new Map(products.map((product) => [product.seller.id, product.seller])).values()
   );
 
-  return { products, sellers, context, demoMode: DEMO_MODE };
+  return {
+    products,
+    sellers,
+    context: effectiveContext,
+    ...(search ? { search } : {}),
+    demoMode: DEMO_MODE,
+  };
 }
 
 export async function findMarketplaceRow(

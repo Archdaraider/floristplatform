@@ -148,6 +148,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS orders_idempotency_key_unique ON orders (idemp
 CREATE INDEX IF NOT EXISTS orders_seller_status_idx ON orders (seller_id, operational_status);
 CREATE INDEX IF NOT EXISTS orders_accept_by_idx ON orders (commercial_status, accept_by);
 
+CREATE TABLE IF NOT EXISTS order_seller_notes (
+  order_id text PRIMARY KEY NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  body text DEFAULT '' NOT NULL,
+  version integer DEFAULT 1 NOT NULL,
+  created_at text DEFAULT CURRENT_TIMESTAMP NOT NULL,
+  updated_at text DEFAULT CURRENT_TIMESTAMP NOT NULL,
+  CONSTRAINT order_seller_notes_body_length CHECK (length(body) <= 5000),
+  CONSTRAINT order_seller_notes_version_positive CHECK (version > 0)
+);
+
 CREATE TABLE IF NOT EXISTS order_events (
   id text PRIMARY KEY NOT NULL,
   order_id text NOT NULL REFERENCES orders(id),
@@ -415,6 +425,27 @@ const PRODUCT_SEEDS = [
     representative_photo_disclosure:
       "Tulips are seasonal; an equivalent premium bloom may be proposed for approval if unavailable.",
     dimensions: "Approximately 42 cm tall · 30 cm wide",
+    fulfilment_methods_json: JSON.stringify(["pickup", "delivery"]),
+    lead_time_hours: 24,
+  },
+  {
+    id: "product-noir-rose-daisy",
+    seller_id: "seller-everlasting-room",
+    slug: "noir-rose-daisy-bouquet",
+    title: "Noir Rose & Daisy Bouquet",
+    description:
+      "Crimson roses and white daisies gathered for an anniversary, finished in a crisp matte-black paper wrap.",
+    status: "published",
+    base_price_cents: 12400,
+    occasion_tags_json: JSON.stringify(["anniversary", "romance", "celebration"]),
+    style_tags_json: JSON.stringify(["romantic", "moody", "black-wrap"]),
+    flower_tags_json: JSON.stringify(["rose", "daisy"]),
+    image_url:
+      "https://images.unsplash.com/photo-1528114848732-d505607e46c3?auto=format&fit=crop&w=1200&q=85",
+    image_alt: "Red rose bouquet with white accents in a dark paper wrap",
+    representative_photo_disclosure:
+      "Rose and daisy varieties follow market quality; the red-white palette and matte-black wrap are preserved.",
+    dimensions: "Approximately 44 cm tall · 30 cm wide",
     fulfilment_methods_json: JSON.stringify(["pickup", "delivery"]),
     lead_time_hours: 24,
   },

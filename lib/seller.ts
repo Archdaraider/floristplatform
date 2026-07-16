@@ -1,9 +1,22 @@
 import { ensureDemoDatabase } from "../db/bootstrap";
 import { ApiError } from "./api";
 import { reconcileExpiredOrders } from "./order-expiry";
-import { DEMO_MODE, MARKET_CURRENCY, MARKET_TIMEZONE, type FulfilmentMethod, type ProductStatus, type SellerSummary } from "./types";
+import {
+  DEMO_MODE,
+  MARKET_CURRENCY,
+  MARKET_TIMEZONE,
+  type FulfilmentMethod,
+  type ProductStatus,
+  type SellerSummary,
+  type TransitionOrderInput,
+} from "./types";
 import { nowIso, localDateFromNow } from "./time";
-import { sellerOrders } from "./orders";
+import {
+  addOrderMessage,
+  getOrderBundle,
+  sellerOrders,
+  transitionOrder,
+} from "./orders";
 
 export const MAIN_DEMO_SELLER_ID = "seller-petal-poem";
 
@@ -58,6 +71,29 @@ interface CapacityRow {
   committed_capacity: number;
 }
 
+interface SellerOrderIdentityRow {
+  id: string;
+}
+
+interface SellerOrderNoteRow {
+  order_id: string;
+  body: string;
+  version: number;
+  created_at: string;
+  updated_at: string;
+}
+
+interface SellerUnreadRow {
+  order_id: string;
+  count: number;
+  last_buyer_message_at: string | null;
+}
+
+interface MessageCutoffRow {
+  id: string;
+  created_at: string;
+}
+
 function stringArray(value: string): string[] {
   try {
     const parsed = JSON.parse(value);
@@ -106,12 +142,177 @@ async function sellerRow(id = MAIN_DEMO_SELLER_ID) {
   return row;
 }
 
-export async function sellerDashboard() {
+async function sellerOrderId(id: string, sellerId = MAIN_DEMO_SELLER_ID) {
+  const database = await ensureDemoDatabase();
+  const row = await database
+    .prepare(
+      `SELECT id
+       FROM orders
+       WHERE (id = ? OR order_number = ?) AND seller_id = ?
+       LIMIT 1`
+    )
+    .bind(id, id, sellerId)
+    .first<SellerOrderIdentityRow>();
+  if (!row) {
+    throw new ApiError(
+      "ORDER_NOT_FOUND",
+      "That order is not part of this seller workspace.",
+      404
+    );
+  }
+  return row.id;
+}
+
+async function sellerOrderNoteRow(orderId: string) {
+  const database = await ensureDemoDatabase();
+  return database
+    .prepare("SELECT * FROM order_seller_notes WHERE order_id = ? LIMIT 1")
+    .bind(orderId)
+    .first<SellerOrderNoteRow>();
+}
+
+function sellerOrderNoteView(row: SellerOrderNoteRow) {
+  return {
+    orderId: row.order_id,
+    body: row.body,
+    version: row.version,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+export async function getSellerOrderNote(id: string, sellerId = MAIN_DEMO_SELLER_ID) {
+  const orderId = await sellerOrderId(id, sellerId);
+  const row = await sellerOrderNoteRow(orderId);
+  return {
+    note: row
+      ? sellerOrderNoteView(row)
+      : { orderId, body: "", version: 0, createdAt: null, updatedAt: null },
+    demoMode: DEMO_MODE,
+  };
+}
+
+export async function updateSellerOrderNote(
+  id: string,
+  rawInput: unknown,
+  sellerId = MAIN_DEMO_SELLER_ID
+) {
+  if (!rawInput || typeof rawInput !== "object" || Array.isArray(rawInput)) {
+    throw new ApiError(
+      "INVALID_SELLER_NOTE",
+      "Seller note must be a JSON object.",
+      422,
+      false,
+      { body: "Enter a note as text." }
+    );
+  }
+
+  const input = rawInput as Record<string, unknown>;
+  if (typeof input.body !== "string") {
+    throw new ApiError(
+      "INVALID_SELLER_NOTE",
+      "Seller note must be text.",
+      422,
+      false,
+      { body: "Enter a note as text." }
+    );
+  }
+  const body = input.body.replace(/\r\n?/g, "\n").trim();
+  if (body.length > 5_000) {
+    throw new ApiError(
+      "INVALID_SELLER_NOTE",
+      "Seller note must be 5,000 characters or fewer.",
+      422,
+      false,
+      { body: "Keep the note to 5,000 characters or fewer." }
+    );
+  }
+  if (
+    !Number.isInteger(input.expectedVersion) ||
+    Number(input.expectedVersion) < 0
+  ) {
+    throw new ApiError(
+      "INVALID_SELLER_NOTE_VERSION",
+      "Expected version must be a non-negative integer.",
+      422,
+      false,
+      { expectedVersion: "Use the version returned when the note was loaded." }
+    );
+  }
+
+  const orderId = await sellerOrderId(id, sellerId);
+  const database = await ensureDemoDatabase();
+  const current = await sellerOrderNoteRow(orderId);
+  const currentVersion = current?.version ?? 0;
+  const expectedVersion = Number(input.expectedVersion);
+
+  if (expectedVersion !== currentVersion) {
+    if (current?.body === body) {
+      return { note: sellerOrderNoteView(current), demoMode: DEMO_MODE };
+    }
+    throw new ApiError(
+      "SELLER_NOTE_VERSION_CONFLICT",
+      "A newer private note was saved elsewhere.",
+      409,
+      false,
+      undefined,
+      "Reload the latest note before deciding whether to replace it."
+    );
+  }
+
+  const now = nowIso();
+  const result = current
+    ? await database
+        .prepare(
+          `UPDATE order_seller_notes
+           SET body = ?, version = version + 1, updated_at = ?
+           WHERE order_id = ? AND version = ?`
+        )
+        .bind(body, now, orderId, currentVersion)
+        .run()
+    : await database
+        .prepare(
+          `INSERT OR IGNORE INTO order_seller_notes
+           (order_id, body, version, created_at, updated_at)
+           VALUES (?, ?, 1, ?, ?)`
+        )
+        .bind(orderId, body, now, now)
+        .run();
+
+  const stored = await sellerOrderNoteRow(orderId);
+  if ((result.meta.changes ?? 0) !== 1) {
+    if (stored?.body === body) {
+      return { note: sellerOrderNoteView(stored), demoMode: DEMO_MODE };
+    }
+    throw new ApiError(
+      "SELLER_NOTE_VERSION_CONFLICT",
+      "A newer private note was saved elsewhere.",
+      409,
+      false,
+      undefined,
+      "Reload the latest note before deciding whether to replace it."
+    );
+  }
+  if (!stored) {
+    throw new ApiError(
+      "SELLER_NOTE_NOT_SAVED",
+      "The private seller note could not be saved.",
+      500,
+      true,
+      undefined,
+      "Retry saving the note."
+    );
+  }
+
+  return { note: sellerOrderNoteView(stored), demoMode: DEMO_MODE };
+}
+
+export async function sellerDashboard(sellerId = MAIN_DEMO_SELLER_ID) {
   await reconcileExpiredOrders();
   const database = await ensureDemoDatabase();
-  const [rawSeller, orders, productResult, capacityResult, unreadResult] = await Promise.all([
-    sellerRow(),
-    sellerOrders(MAIN_DEMO_SELLER_ID),
+  const [rawSeller, rawOrders, productResult, capacityResult, unreadResult] = await Promise.all([
+    sellerRow(sellerId),
+    sellerOrders(sellerId),
     database
       .prepare(
         `SELECT p.id, p.slug, p.title, p.status, p.base_price_cents, p.image_url, p.image_alt,
@@ -123,7 +324,7 @@ export async function sellerDashboard() {
          GROUP BY p.id
          ORDER BY p.updated_at DESC`
       )
-      .bind(MAIN_DEMO_SELLER_ID)
+      .bind(sellerId)
       .all<SellerProductRow>(),
     database
       .prepare(
@@ -132,17 +333,44 @@ export async function sellerDashboard() {
          WHERE seller_id = ? AND date_local BETWEEN ? AND ?
          ORDER BY date_local ASC, method ASC`
       )
-      .bind(MAIN_DEMO_SELLER_ID, localDateFromNow(0), localDateFromNow(7))
+      .bind(sellerId, localDateFromNow(0), localDateFromNow(6))
       .all<CapacityRow>(),
     database
       .prepare(
-        `SELECT COUNT(*) AS count
-         FROM messages m JOIN orders o ON o.id = m.order_id
-         WHERE o.seller_id = ? AND m.sender_role = 'buyer' AND m.read_at IS NULL`
+        `SELECT o.id AS order_id,
+                COUNT(m.id) AS count,
+                MAX(m.created_at) AS last_buyer_message_at
+         FROM orders o
+         LEFT JOIN messages m
+           ON m.order_id = o.id
+          AND m.sender_role = 'buyer'
+          AND m.read_at IS NULL
+         WHERE o.seller_id = ?
+         GROUP BY o.id`
       )
-      .bind(MAIN_DEMO_SELLER_ID)
-      .first<{ count: number }>(),
+      .bind(sellerId)
+      .all<SellerUnreadRow>(),
   ]);
+
+  const unreadByOrder = new Map(
+    unreadResult.results.map((row) => [
+      row.order_id,
+      {
+        count: Number(row.count),
+        lastBuyerMessageAt: row.last_buyer_message_at,
+      },
+    ])
+  );
+  const orders = rawOrders.map((order) => {
+    const unread = unreadByOrder.get(order.id);
+    return {
+      ...order,
+      unreadBuyerMessages: unread?.count ?? 0,
+      ...(unread?.lastBuyerMessageAt
+        ? { lastBuyerMessageAt: unread.lastBuyerMessageAt }
+        : {}),
+    };
+  });
 
   const products = productResult.results.map((product) => ({
     id: product.id,
@@ -192,7 +420,10 @@ export async function sellerDashboard() {
       awaitingAcceptance: awaitingAcceptance.length,
       activeOrders: activeOrders.length,
       dueToday: dueToday.length,
-      unreadMessages: unreadResult?.count ?? 0,
+      unreadMessages: orders.reduce(
+        (total, order) => total + order.unreadBuyerMessages,
+        0
+      ),
       payoutPendingCents,
       currency: MARKET_CURRENCY,
     },
@@ -201,7 +432,10 @@ export async function sellerDashboard() {
   };
 }
 
-export async function updateSellerSettings(rawInput: unknown) {
+export async function updateSellerSettings(
+  rawInput: unknown,
+  sellerId = MAIN_DEMO_SELLER_ID
+) {
   if (!rawInput || typeof rawInput !== "object" || Array.isArray(rawInput)) {
     throw new ApiError("INVALID_SETTINGS", "Seller settings must be a JSON object.", 422);
   }
@@ -260,7 +494,7 @@ export async function updateSellerSettings(rawInput: unknown) {
     }
   }
   const database = await ensureDemoDatabase();
-  const current = await sellerRow();
+  const current = await sellerRow(sellerId);
   const accepting =
     typeof input.acceptingNewOrders === "boolean"
       ? input.acceptingNewOrders
@@ -289,15 +523,16 @@ export async function updateSellerSettings(rawInput: unknown) {
        SET accepting_new_orders = ?, paused_until = ?, status = ?, updated_at = ?
        WHERE id = ?`
     )
-    .bind(accepting ? 1 : 0, pausedUntil, status, now, MAIN_DEMO_SELLER_ID)
+    .bind(accepting ? 1 : 0, pausedUntil, status, now, sellerId)
     .run();
-  const updated = await sellerRow();
+  const updated = await sellerRow(sellerId);
   return { seller: mapSeller(updated), demoMode: DEMO_MODE };
 }
 
 export async function updateProductStatus(
   id: string,
-  input: { status?: "published" | "paused"; published?: boolean }
+  input: { status?: "published" | "paused"; published?: boolean },
+  sellerId = MAIN_DEMO_SELLER_ID
 ) {
   const database = await ensureDemoDatabase();
   if (!input || typeof input !== "object") {
@@ -321,12 +556,12 @@ export async function updateProductStatus(
       `UPDATE products SET status = ?, published_at = CASE WHEN ? = 'published' THEN COALESCE(published_at, ?) ELSE published_at END,
        updated_at = ? WHERE id = ? AND seller_id = ? AND status != 'archived'`
     )
-    .bind(status, status, now, now, id, MAIN_DEMO_SELLER_ID)
+    .bind(status, status, now, now, id, sellerId)
     .run();
   if ((result.meta.changes ?? 0) !== 1) {
     throw new ApiError(
       "PRODUCT_NOT_FOUND",
-      "That product is not part of the main demo seller catalogue.",
+      "That product is not part of this seller catalogue.",
       404
     );
   }
@@ -354,6 +589,129 @@ export async function updateProductStatus(
     },
     demoMode: DEMO_MODE,
   };
+}
+
+export async function markSellerOrderMessagesRead(
+  id: string,
+  rawInput: unknown = {},
+  sellerId = MAIN_DEMO_SELLER_ID
+) {
+  if (!rawInput || typeof rawInput !== "object" || Array.isArray(rawInput)) {
+    throw new ApiError(
+      "INVALID_MESSAGE_READ_RECEIPT",
+      "Message read details must be a JSON object.",
+      422
+    );
+  }
+  const input = rawInput as Record<string, unknown>;
+  if (
+    input.throughMessageId !== undefined &&
+    typeof input.throughMessageId !== "string"
+  ) {
+    throw new ApiError(
+      "INVALID_MESSAGE_READ_RECEIPT",
+      "The visible message reference must be text.",
+      422,
+      false,
+      { throughMessageId: "Use the id of the latest visible buyer message." }
+    );
+  }
+
+  const orderId = await sellerOrderId(id, sellerId);
+  const database = await ensureDemoDatabase();
+  const throughMessageId =
+    typeof input.throughMessageId === "string"
+      ? input.throughMessageId.trim()
+      : "";
+  let cutoff: MessageCutoffRow | null = null;
+  if (throughMessageId) {
+    cutoff = await database
+      .prepare(
+        `SELECT id, created_at
+         FROM messages
+         WHERE id = ? AND order_id = ? AND sender_role = 'buyer'
+         LIMIT 1`
+      )
+      .bind(throughMessageId, orderId)
+      .first<MessageCutoffRow>();
+    if (!cutoff) {
+      throw new ApiError(
+        "BUYER_MESSAGE_NOT_FOUND",
+        "That buyer message is not part of this seller order.",
+        404
+      );
+    }
+  }
+
+  const readAt = nowIso();
+  const result = cutoff
+    ? await database
+        .prepare(
+          `UPDATE messages
+           SET read_at = ?
+           WHERE order_id = ?
+             AND sender_role = 'buyer'
+             AND read_at IS NULL
+             AND (created_at < ? OR (created_at = ? AND id <= ?))`
+        )
+        .bind(readAt, orderId, cutoff.created_at, cutoff.created_at, cutoff.id)
+        .run()
+    : await database
+        .prepare(
+          `UPDATE messages
+           SET read_at = ?
+           WHERE order_id = ? AND sender_role = 'buyer' AND read_at IS NULL`
+        )
+        .bind(readAt, orderId)
+        .run();
+
+  return {
+    orderId,
+    markedCount: result.meta.changes ?? 0,
+    readAt,
+    demoMode: DEMO_MODE,
+  };
+}
+
+export async function getSellerOrderBundle(
+  id: string,
+  sellerId = MAIN_DEMO_SELLER_ID
+) {
+  const orderId = await sellerOrderId(id, sellerId);
+  return getOrderBundle(orderId);
+}
+
+export async function transitionSellerOrder(
+  id: string,
+  input: TransitionOrderInput,
+  idempotencyKey: string,
+  sellerId = MAIN_DEMO_SELLER_ID
+) {
+  const orderId = await sellerOrderId(id, sellerId);
+  return transitionOrder(orderId, input, idempotencyKey);
+}
+
+export async function addSellerOrderMessage(
+  id: string,
+  rawInput: unknown,
+  idempotencyKey: string,
+  sellerId = MAIN_DEMO_SELLER_ID
+) {
+  if (!rawInput || typeof rawInput !== "object" || Array.isArray(rawInput)) {
+    throw new ApiError("INVALID_MESSAGE", "Message details must be a JSON object.", 422);
+  }
+  const orderId = await sellerOrderId(id, sellerId);
+  const seller = await sellerRow(sellerId);
+  const input = rawInput as Record<string, unknown>;
+  return addOrderMessage(
+    orderId,
+    {
+      body: input.body,
+      senderRole: "seller",
+      senderName: seller.trading_name,
+    },
+    idempotencyKey
+  );
 }
 
 export async function allSellerReviewData() {

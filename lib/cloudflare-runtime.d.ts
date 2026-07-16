@@ -31,9 +31,15 @@ interface Fetcher {
   fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response>;
 }
 
+interface WorkersAi {
+  run(model: string, input: Record<string, unknown>): Promise<unknown>;
+}
+
 declare module "cloudflare:workers" {
   export const env: {
     DB?: D1Database;
+    AI?: WorkersAi;
+    GROQ_API_KEY?: string;
     [binding: string]: unknown;
   };
 }

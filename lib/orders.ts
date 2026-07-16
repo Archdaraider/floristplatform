@@ -20,12 +20,13 @@ import {
   type OrderAction,
   type OrderDetail,
   type OrderEventView,
+  type SellerOrderSummary,
   type OrderView,
   type ProductDetail,
   type ProductSnapshot,
   type TransitionOrderInput,
 } from "./types";
-import { addMinutesIso, isValidLocalDate, nowIso } from "./time";
+import { addMinutesIso, isValidLocalDate, nowIso, singaporeDate } from "./time";
 
 interface OrderRow {
   id: string;
@@ -244,6 +245,35 @@ function nextAction(row: OrderRow): OrderView["nextAction"] {
   }
 }
 
+function transitionSystemMessage(
+  action: OrderAction,
+  row: OrderRow,
+  reason?: string
+) {
+  switch (action) {
+    case "accept":
+      return "Your florist confirmed the order and the demo payment was captured.";
+    case "decline":
+      return reason
+        ? `The florist could not accept this request: ${reason}`
+        : "The florist could not accept this request.";
+    case "preparing":
+      return "Your florist started arranging the flowers.";
+    case "ready":
+      return row.fulfilment_method === "pickup"
+        ? "Your flowers are ready for pickup."
+        : "Your flowers are ready for the seller’s courier.";
+    case "out_for_delivery":
+      return "Your flowers are out for delivery.";
+    case "delivered":
+      return "The florist recorded the flowers as delivered.";
+    case "fulfilled":
+      return row.fulfilment_method === "pickup"
+        ? "Pickup was confirmed complete."
+        : "The delivered order was closed as complete.";
+  }
+}
+
 function mapOrder(row: OrderRow, detail = false): OrderView | OrderDetail {
   const base: OrderView = {
     id: row.id,
@@ -295,6 +325,9 @@ function mapOrder(row: OrderRow, detail = false): OrderView | OrderDetail {
     ...(row.gift_message ? { giftMessage: row.gift_message } : {}),
     ...(row.delivery_instructions
       ? { deliveryInstructions: row.delivery_instructions }
+      : {}),
+    ...(row.fulfilment_method === "pickup" && row.seller_type !== "home" && row.public_address
+      ? { pickupLocation: row.public_address }
       : {}),
     policies: objectJson<ProductDetail["policies"]>(row.policy_snapshot_json),
   };
@@ -477,7 +510,7 @@ function orderContext(input: CreateOrderInput): CatalogContext {
 }
 
 function orderNumber(now: string) {
-  const date = now.slice(2, 10).replaceAll("-", "");
+  const date = singaporeDate(new Date(now)).slice(2).replaceAll("-", "");
   const suffix = crypto.randomUUID().slice(0, 5).toUpperCase();
   return `FL-${date}-${suffix}`;
 }
@@ -1032,7 +1065,7 @@ export async function transitionOrder(
     .bind(
       crypto.randomUUID(),
       row.id,
-      `Order updated: ${input.action.replaceAll("_", " ")}.`,
+      transitionSystemMessage(input.action, row, input.reason),
       `transition:${eventId}:message`,
       now,
       eventId,
@@ -1207,7 +1240,7 @@ export async function addOrderMessage(
   return { message, demoMode: DEMO_MODE };
 }
 
-export async function sellerOrders(sellerId: string): Promise<OrderView[]> {
+export async function sellerOrders(sellerId: string): Promise<SellerOrderSummary[]> {
   await reconcileExpiredOrders();
   const database = await ensureDemoDatabase();
   const result = await database
@@ -1218,5 +1251,8 @@ export async function sellerOrders(sellerId: string): Promise<OrderView[]> {
     )
     .bind(sellerId)
     .all<OrderRow>();
-  return result.results.map((row) => mapOrder(row) as OrderView);
+  return result.results.map((row) => ({
+    ...(mapOrder(row) as OrderView),
+    recipientName: row.recipient_name ?? row.buyer_name,
+  }));
 }

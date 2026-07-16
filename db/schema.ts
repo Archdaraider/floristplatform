@@ -238,6 +238,23 @@ export const orders = sqliteTable(
   ]
 );
 
+export const orderSellerNotes = sqliteTable(
+  "order_seller_notes",
+  {
+    orderId: text("order_id")
+      .primaryKey()
+      .references(() => orders.id, { onDelete: "cascade" }),
+    body: text("body").notNull().default(""),
+    version: integer("version").notNull().default(1),
+    createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+    updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  },
+  (table) => [
+    check("order_seller_notes_body_length", sql`length(${table.body}) <= 5000`),
+    check("order_seller_notes_version_positive", sql`${table.version} > 0`),
+  ]
+);
+
 export const orderEvents = sqliteTable(
   "order_events",
   {

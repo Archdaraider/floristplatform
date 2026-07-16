@@ -24,9 +24,81 @@ function getProgress(order: Order) {
     { label: "Request placed", detail: "Capacity reserved and payment authorised", done: true, active: !confirmed },
     { label: "Florist confirmed", detail: "Payment captured when the seller accepts", done: confirmed, active: confirmed && !preparing },
     { label: "Being arranged", detail: "Your florist is preparing the flowers", done: preparing, active: preparing && !ready },
-    { label: order.fulfilmentMethod === "pickup" ? "Ready for pickup" : inTransit ? "Out for delivery" : "Ready for courier", detail: order.fulfilmentWindow, done: ready, active: ready && !complete },
+    { label: order.fulfilmentMethod === "pickup" ? "Ready for pickup" : inTransit || complete ? "Out for delivery" : "Ready for courier", detail: order.fulfilmentWindow, done: ready, active: ready && !complete },
     { label: order.fulfilmentMethod === "pickup" ? "Collected" : "Delivered", detail: "Order completed", done: complete, active: complete },
   ];
+}
+
+function buyerStatus(order: Order) {
+  if (order.commercialStatus === "declined") {
+    return {
+      key: "declined",
+      label: "Declined",
+      headline: "The florist could not accept this request.",
+      detail: "The reserved capacity was released and the demo payment authorisation was voided.",
+    };
+  }
+  if (order.commercialStatus === "completed") {
+    return {
+      key: "completed",
+      label: "Complete",
+      headline: order.fulfilmentMethod === "pickup" ? "Your flowers were collected." : "Your flowers were delivered.",
+      detail: "This order is complete. The activity record remains available below.",
+    };
+  }
+
+  const operationalStatus = order.productionStatus ?? order.fulfilmentStatus ?? "awaiting_acceptance";
+  switch (operationalStatus) {
+    case "accepted":
+      return {
+        key: "accepted",
+        label: "Confirmed",
+        headline: "Your florist confirmed the order.",
+        detail: `${order.sellerName} has accepted the request and will prepare it for ${order.fulfilmentMethod}.`,
+      };
+    case "preparing":
+      return {
+        key: "preparing",
+        label: "Being arranged",
+        headline: "Your flowers are being arranged.",
+        detail: `${order.sellerName} is preparing your arrangement for the selected fulfilment window.`,
+      };
+    case "ready":
+      return {
+        key: "ready",
+        label: order.fulfilmentMethod === "pickup" ? "Ready for pickup" : "Ready for courier",
+        headline: order.fulfilmentMethod === "pickup" ? "Your flowers are ready for pickup." : "Your flowers are ready for the courier.",
+        detail: order.fulfilmentMethod === "pickup" ? "Use the pickup location and window below." : "The seller will update this order when it leaves for delivery.",
+      };
+    case "out_for_delivery":
+      return {
+        key: "out_for_delivery",
+        label: "Out for delivery",
+        headline: "Your flowers are on the way.",
+        detail: "The seller-managed courier is delivering during the confirmed window.",
+      };
+    case "delivered":
+      return {
+        key: "delivered",
+        label: "Delivered",
+        headline: "Your flowers were delivered.",
+        detail: "The florist recorded delivery. Final fulfilment closure is in progress.",
+      };
+    case "fulfilled":
+      return {
+        key: "fulfilled",
+        label: "Complete",
+        headline: order.fulfilmentMethod === "pickup" ? "Your flowers were collected." : "Your flowers were delivered.",
+        detail: "This order is complete. The activity record remains available below.",
+      };
+    default:
+      return {
+        key: "awaiting_seller",
+        label: "Awaiting florist",
+        headline: "Your florist is reviewing the request.",
+        detail: `${order.sellerName} will confirm by ${formatSingaporeDate(order.acceptBy, true)} SGT. The demo payment authorisation is held and captured only if accepted.`,
+      };
+  }
 }
 
 export function OrderTrackerApp({ orderId }: { orderId: string }) {
@@ -96,6 +168,7 @@ export function OrderTrackerApp({ orderId }: { orderId: string }) {
   }, [orderId]);
 
   const progress = useMemo(() => order ? getProgress(order) : [], [order]);
+  const currentStatus = useMemo(() => order ? buyerStatus(order) : null, [order]);
 
   async function sendMessage(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -151,21 +224,17 @@ export function OrderTrackerApp({ orderId }: { orderId: string }) {
           <p>{error || "The order reference is unavailable."}</p>
           <Link href="/" className="primary-button">Return to marketplace</Link>
         </section>
-      ) : (
+      ) : currentStatus ? (
         <div className="tracking-shell page-shell">
           <section className="tracking-hero">
             <div>
               <p className="eyebrow">{order.orderNumber} · demo order access</p>
-              <h1>{order.commercialStatus === "awaiting_seller" ? "Your florist is reviewing the request." : humanizeStatus(order.nextAction ?? order.commercialStatus)}</h1>
-              <p>
-                {order.commercialStatus === "awaiting_seller"
-                  ? `${order.sellerName} has until ${formatSingaporeDate(order.acceptBy, true)} SGT to confirm. Your simulated payment is authorised, not captured.`
-                  : `The latest order state is ${humanizeStatus(order.commercialStatus).toLowerCase()}. This page refreshes as the florist updates fulfilment.`}
-              </p>
+              <h1>{currentStatus.headline}</h1>
+              <p>{currentStatus.detail} This page refreshes automatically.</p>
             </div>
             <div className="tracking-hero__status">
-              <span className={`large-status-dot status-${order.commercialStatus}`} aria-hidden="true" />
-              <div><span>Current state</span><strong>{humanizeStatus(order.commercialStatus)}</strong><small>{humanizeStatus(order.paymentStatus)} payment</small></div>
+              <span className={`large-status-dot status-${currentStatus.key}`} aria-hidden="true" />
+              <div><span>Current state</span><strong>{currentStatus.label}</strong><small>{humanizeStatus(order.paymentStatus)} payment</small></div>
             </div>
           </section>
           {refreshNotice && <p className="dashboard-feedback" role="status">{refreshNotice}</p>}
@@ -173,7 +242,7 @@ export function OrderTrackerApp({ orderId }: { orderId: string }) {
           {order.commercialStatus === "awaiting_seller" && (
             <aside className="demo-handoff">
               <div><span className="detail-label">Continue the interactive demo</span><strong>Accept this request from the seller pathway.</strong><p>The payment and buyer timeline will update here after the seller acts.</p></div>
-              <Link href="/seller" className="primary-button"><span>Open seller studio</span><span className="button-arrow" aria-hidden="true">→</span></Link>
+              <Link href={`/seller?sellerId=${encodeURIComponent(order.sellerId)}&orderId=${encodeURIComponent(order.id)}`} className="primary-button"><span>Open this florist studio</span><span className="button-arrow" aria-hidden="true">→</span></Link>
             </aside>
           )}
 
@@ -191,14 +260,28 @@ export function OrderTrackerApp({ orderId }: { orderId: string }) {
 
               {order.fulfilmentMethod === "pickup" && (
                 <div className="pickup-instructions">
-                  <span className="detail-label">Private pickup instructions</span>
-                  {order.privatePickupInstructions ? (
-                    <><strong>{order.privatePickupInstructions}</strong><p>Released only because this order is confirmed and paid.</p></>
+                  <span className="detail-label">Pickup location</span>
+                  {order.pickupLocation || order.privatePickupInstructions ? (
+                    <><strong>{order.pickupLocation || order.privatePickupInstructions}</strong><p>Use the confirmed pickup window above. Message the florist if you need handoff help.</p></>
                   ) : (
-                    <><strong>{order.publicPickupArea || "Collection location shown after confirmation"}</strong><p>Final collection instructions are confirmed in this order thread after seller acceptance.</p></>
+                    <><strong>{order.publicPickupArea || "Collection location pending"}</strong><p>The florist will confirm the collection point in this order thread.</p></>
                   )}
                 </div>
               )}
+
+              <section className="buyer-order-details" aria-labelledby={`buyer-order-details-${order.id}`}>
+                <div>
+                  <span className="detail-label">Order details</span>
+                  <h3 id={`buyer-order-details-${order.id}`}>Check the fulfilment information</h3>
+                </div>
+                <dl>
+                  <div><dt>{order.fulfilmentMethod === "pickup" ? "Collector" : "Recipient"}</dt><dd>{order.recipientName}</dd></div>
+                  {order.recipientPhone && <div><dt>Contact</dt><dd>{order.recipientPhone}</dd></div>}
+                  {order.fulfilmentMethod === "delivery" && <div><dt>Delivery address</dt><dd>{order.addressLine}{order.postcode ? ` · Singapore ${order.postcode}` : ""}</dd></div>}
+                  {order.deliveryInstructions && <div><dt>Delivery instructions</dt><dd>{order.deliveryInstructions}</dd></div>}
+                  {order.cardMessage && <div><dt>Message card</dt><dd>“{order.cardMessage}”</dd></div>}
+                </dl>
+              </section>
 
               <div className="order-summary-block">
                 <img src={order.productImageUrl || "https://images.unsplash.com/photo-1563241527-3004b7be0ffd?auto=format&fit=crop&w=600&q=80"} alt="" />
@@ -222,7 +305,7 @@ export function OrderTrackerApp({ orderId }: { orderId: string }) {
                       <p>{message.body}</p>
                       <time>{formatSingaporeDate(message.createdAt, true)}</time>
                     </div>
-                  )) : <p className="message-empty">Ask the florist a question about this order. Buyer, seller, support, and system messages remain visibly labelled.</p>}
+                  )) : <p className="message-empty">Ask a question about this order. Florist and support replies will appear here.</p>}
                 </div>
                 <form className="message-form" onSubmit={sendMessage}>
                   <label><span>Message florist</span><textarea name="body" rows={3} placeholder="Write an order-specific question" maxLength={500} required /></label>
@@ -233,9 +316,8 @@ export function OrderTrackerApp({ orderId }: { orderId: string }) {
 
               <section className="support-card">
                 <span className="detail-label">Need help?</span>
-                <h3>Production support will join this order thread.</h3>
-                <p>Report lateness, damage, incorrect items, or a missing delivery without moving the conversation off-platform.</p>
-                <button type="button" className="text-button" onClick={() => setNotice("Issue reporting is represented in this first build; evidence upload and refunds connect in the production phase.")}>Report an issue</button>
+                <h3>Keep support in this order thread.</h3>
+                <p>Use Messages for help with lateness, damage, incorrect items, or a missing delivery.</p>
               </section>
             </aside>
           </div>
@@ -249,7 +331,7 @@ export function OrderTrackerApp({ orderId }: { orderId: string }) {
             </div>
           </section>
         </div>
-      )}
+      ) : null}
     </main>
   );
 }

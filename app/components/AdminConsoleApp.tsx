@@ -17,7 +17,6 @@ export function AdminConsoleApp() {
   const [hasLoadedAdmin, setHasLoadedAdmin] = useState(false);
   const [loadError, setLoadError] = useState("");
   const [selectedReview, setSelectedReview] = useState<AdminRecord | null>(null);
-  const [actionNotice, setActionNotice] = useState("");
   const hasLoadedAdminRef = useRef(false);
   const reviewDrawerRef = useRef<HTMLElement>(null);
   useAccessibleDialog({
@@ -91,7 +90,6 @@ export function AdminConsoleApp() {
             <button className="secondary-button" type="button" onClick={() => void loadAdmin()}>Refresh records</button>
           </section>
           {loadError && <p className="dashboard-feedback dashboard-feedback--error" role="status">{loadError}</p>}
-          {actionNotice && !selectedReview && <p className="dashboard-feedback" role="status">{actionNotice}</p>}
 
           <section className="admin-metrics" aria-label="Marketplace metrics">
             <div><span>Florists live</span><strong>{hasLoadedAdmin ? sellersLive : "—"}</strong><small>of 10–15 beta target</small></div>
@@ -102,11 +100,11 @@ export function AdminConsoleApp() {
 
           <div className="admin-grid">
             <section id="reviews" className="admin-panel admin-panel--reviews">
-              <div className="admin-panel__heading"><div><p className="eyebrow">Supply quality</p><h2>Seller review</h2></div><span>{hasLoadedAdmin ? `${awaitingReview} actionable` : "Status unknown"}</span></div>
+              <div className="admin-panel__heading"><div><p className="eyebrow">Supply quality</p><h2>Seller review</h2></div><span>{hasLoadedAdmin ? `${awaitingReview} pending` : "Status unknown"}</span></div>
               {isLoading ? <div className="dashboard-skeleton" /> : !hasLoadedAdmin ? (
                 <div className="admin-empty"><strong>Review status unavailable</strong><p>Refresh before treating this queue as clear.</p></div>
               ) : reviews.length ? reviews.map((review) => (
-                <button className="seller-review-row" type="button" key={String(review.id)} onClick={() => { setActionNotice(""); setSelectedReview(review); }}>
+                <button className="seller-review-row" type="button" key={String(review.id)} onClick={() => setSelectedReview(review)}>
                   <span className="review-monogram">{String(review.sellerName ?? "FS").split(" ").map((part) => part[0]).slice(0, 2).join("")}</span>
                   <div><strong>{String(review.sellerName ?? review.tradingName ?? review.name ?? "Florist application")}</strong><span>{String(review.sellerType ?? "Independent florist")} · {String(review.area ?? review.publicArea ?? "Singapore")}</span></div>
                   <div><span className="status-tag">{humanizeStatus(String(review.approvalState ?? review.status ?? "under_review"))}</span><small>Submitted {formatSingaporeDate(String(review.submittedAt ?? "2026-07-13T08:00:00.000Z"))}</small></div>
@@ -159,9 +157,7 @@ export function AdminConsoleApp() {
               <div><span>Public search area</span><strong>{String(selectedReview.area ?? selectedReview.publicArea ?? "Singapore")}</strong></div>
             </div>
             <div className="protected-note"><strong>Private location handling</strong><p>The review payload shows a public search area only. Opening an exact production or pickup address would require a purpose and create an audit event.</p></div>
-            <label className="review-reason"><span>Decision note</span><textarea rows={4} placeholder="Record evidence, rationale, or information needed" /></label>
-            {actionNotice && <p className="dashboard-feedback review-action-notice" role="status">{actionNotice}</p>}
-            <div className="review-actions"><button className="primary-button" type="button" onClick={() => setActionNotice("Approval mutation is intentionally not connected in this demo. Production requires role checks, a recorded reason, and an audit event.")}>Approve after checks</button><button className="secondary-button" type="button" onClick={() => setActionNotice("Information request represented; transactional email integration is a production adapter.")}>Request information</button></div>
+            <p className="read-only-note"><strong>Read-only demo</strong><span>Approval and information-request actions are not connected yet.</span></p>
           </aside>
         </div>
       )}

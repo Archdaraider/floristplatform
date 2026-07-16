@@ -30,6 +30,15 @@ type CartItem = {
   plan: MarketplacePlan;
 };
 
+type SmartSearchMeta = {
+  correctedQuery: string;
+  exact: boolean;
+  labels: string[];
+  matchedLabels: string[];
+  missingLabels: string[];
+  appliedBudgetMaxCents?: number;
+};
+
 const CHECKOUT_FIELD_NAMES: Record<string, string> = {
   "buyer.name": "buyerName",
   "buyer.email": "buyerEmail",
@@ -68,15 +77,39 @@ function clearRetryKey(storageKey: string) {
   }
 }
 
-function getDefaultDate() {
-  const date = new Date();
-  date.setDate(date.getDate() + 3);
+function singaporeDateFromNow(days: number) {
+  const date = new Date(Date.now() + days * 86_400_000);
   return new Intl.DateTimeFormat("en-CA", {
     timeZone: "Asia/Singapore",
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
   }).format(date);
+}
+
+function getDefaultDate() {
+  return singaporeDateFromNow(3);
+}
+
+function getMinimumDate() {
+  return singaporeDateFromNow(0);
+}
+
+function planSummary(plan: MarketplacePlan) {
+  const method = plan.method === "delivery" ? "Delivery" : "Pickup";
+  return `${method} · ${plan.date}${plan.method === "delivery" ? ` · Singapore ${plan.postcode}` : ""}`;
+}
+
+function smartSearchNote(count: number, search: SmartSearchMeta) {
+  const resultLabel = `${count} ${count === 1 ? "match" : "matches"}`;
+  if (search.exact) return `${resultLabel} · ${search.correctedQuery}.`;
+  if (search.matchedLabels.length) {
+    const missing = search.missingLabels.length
+      ? ` Couldn’t confirm ${search.missingLabels.join(" + ")}.`
+      : "";
+    return `No exact match. Showing ${resultLabel} closest to ${search.matchedLabels.join(" + ")}.${missing}`;
+  }
+  return `Showing ${resultLabel} available. Try a flower, occasion, colour, or wrapping style.`;
 }
 
 export function normalizeProduct(raw: Record<string, unknown>): Product {
@@ -129,12 +162,22 @@ export function normalizeProduct(raw: Record<string, unknown>): Product {
     confirmationMinutes: Number(raw.confirmationMinutes ?? availability.confirmationMinutes ?? 60),
     rating: Number(raw.rating ?? 4.8),
     reviewCount: Number(raw.reviewCount ?? 0),
-    stemCount: raw.stemCount ? String(raw.stemCount) : "Seasonal stem count varies",
+    stemCount: raw.stemCount ? String(raw.stemCount) : undefined,
     includedItems: Array.isArray(raw.includedItems)
       ? (raw.includedItems as string[])
-      : ["Seasonal arrangement", "Message card", "Gift wrap"],
+      : undefined,
+    dimensions: raw.dimensions ? String(raw.dimensions) : undefined,
+    representativePhotoDisclosure: raw.representativePhotoDisclosure
+      ? String(raw.representativePhotoDisclosure)
+      : undefined,
+    policies:
+      raw.policies && typeof raw.policies === "object"
+        ? (raw.policies as Product["policies"])
+        : undefined,
     status: (raw.status as Product["status"]) ?? "published",
-    representativePhoto: Boolean(raw.representativePhoto ?? true),
+    representativePhoto: Boolean(
+      raw.representativePhoto ?? raw.representativePhotoDisclosure,
+    ),
   };
 }
 
@@ -144,7 +187,9 @@ export function ConsumerMarketplace() {
   const [postcode, setPostcode] = useState("168732");
   const [budget, setBudget] = useState("140");
   const [style, setStyle] = useState("All styles");
-  const [occasion, setOccasion] = useState("birthday");
+  const [occasion, setOccasion] = useState("");
+  const [flowerQuery, setFlowerQuery] = useState("");
+  const [activeFlowerQuery, setActiveFlowerQuery] = useState("");
   const [products, setProducts] = useState<Product[]>([]);
   const [sellers, setSellers] = useState<Seller[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -156,14 +201,16 @@ export function ConsumerMarketplace() {
     postcode: "168732",
     budget: "140",
     style: "All styles",
-    occasion: "birthday",
+    occasion: "",
   }));
   const [selectedProduct, setSelectedProduct] = useState<Product | null>(null);
+  const [productDetailStatus, setProductDetailStatus] = useState<"idle" | "loading" | "ready" | "error" | "unavailable">("idle");
   const [cartItem, setCartItem] = useState<CartItem | null>(null);
   const [cartOpen, setCartOpen] = useState(false);
   const [checkoutOpen, setCheckoutOpen] = useState(false);
   const [cartNotice, setCartNotice] = useState("");
   const catalogueRequest = useRef(0);
+  const productDetailRequest = useRef(0);
   const initialPlan = useRef<MarketplacePlan>({
     date,
     method,
@@ -174,9 +221,14 @@ export function ConsumerMarketplace() {
   });
 
   const draftPlan: MarketplacePlan = { date, method, postcode, budget, style, occasion };
-  const hasPendingPlanChanges = JSON.stringify(draftPlan) !== JSON.stringify(activePlan);
+  const hasPendingPlanChanges =
+    JSON.stringify(draftPlan) !== JSON.stringify(activePlan) ||
+    flowerQuery.trim() !== activeFlowerQuery;
 
-  async function searchCatalogue(plan: MarketplacePlan = draftPlan) {
+  async function searchCatalogue(
+    plan: MarketplacePlan = draftPlan,
+    query: string = flowerQuery,
+  ) {
     const requestId = ++catalogueRequest.current;
     const searchParams = new URLSearchParams({
       date: plan.date,
@@ -186,20 +238,34 @@ export function ConsumerMarketplace() {
       style: plan.style === "All styles" ? "" : plan.style,
       occasion: plan.occasion,
     });
+    if (query.trim()) searchParams.set("q", query.trim());
     setIsLoading(true);
     setSearchError("");
-    setSearchNote("Checking each florist’s date, capacity, and service area…");
+    setSearchNote(
+      query.trim()
+        ? "Understanding your request and checking florist availability…"
+        : "Checking each florist’s date, capacity, and service area…",
+    );
     try {
       const response = await fetch(`/api/v1/catalog?${searchParams.toString()}`);
       if (!response.ok) throw new Error("Catalogue unavailable");
       const data = (await response.json()) as {
         products?: Record<string, unknown>[];
         sellers?: Seller[];
+        search?: SmartSearchMeta;
       };
       const nextProducts = (data.products ?? []).map(normalizeProduct);
       if (requestId !== catalogueRequest.current) return;
+      const appliedBudget = data.search?.appliedBudgetMaxCents
+        ? Math.min(Number(plan.budget) * 100, data.search.appliedBudgetMaxCents)
+        : undefined;
+      const appliedPlan = appliedBudget
+        ? { ...plan, budget: String(Math.round(appliedBudget / 100)) }
+        : plan;
       setProducts(nextProducts);
-      setActivePlan(plan);
+      setActivePlan(appliedPlan);
+      setActiveFlowerQuery(query.trim());
+      if (appliedBudget) setBudget(appliedPlan.budget);
       setSellers((data.sellers ?? []).map((seller) => {
         const raw = seller as unknown as Record<string, unknown>;
         return {
@@ -214,24 +280,30 @@ export function ConsumerMarketplace() {
         };
       }));
       setSearchNote(
-        nextProducts.length
-          ? `${nextProducts.length} arrangements can be fulfilled for this plan.`
-          : "Nothing fits every part of this plan yet. Try another date, method, or budget.",
+        data.search
+          ? smartSearchNote(nextProducts.length, data.search)
+          : nextProducts.length
+            ? `${nextProducts.length} arrangements available · ${planSummary(appliedPlan)}.`
+            : `No exact matches · ${planSummary(appliedPlan)}. Try another date, method, or budget.`,
       );
     } catch {
       if (requestId !== catalogueRequest.current) return;
-      setProducts([]);
-      setSellers([]);
       const message = "The availability service could not be reached. Check the demo server, then try again.";
-      setSearchError(message);
-      setSearchNote(message);
+      if (products.length) {
+        setSearchNote(`${message} Your previous results are still shown.`);
+      } else {
+        setProducts([]);
+        setSellers([]);
+        setSearchError(message);
+        setSearchNote(message);
+      }
     } finally {
       if (requestId === catalogueRequest.current) setIsLoading(false);
     }
   }
 
   useEffect(() => {
-    const initialLoad = window.setTimeout(() => void searchCatalogue(initialPlan.current), 0);
+    const initialLoad = window.setTimeout(() => void searchCatalogue(initialPlan.current, ""), 0);
     return () => window.clearTimeout(initialLoad);
     // Initial availability check only; subsequent searches are explicit.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -240,18 +312,55 @@ export function ConsumerMarketplace() {
   function addToCart(product: Product) {
     if (cartItem && cartItem.product.sellerId !== product.sellerId) {
       setCartNotice(
-        `Your basket is with ${cartItem.product.sellerName}. Clear it before ordering from ${product.sellerName}; each order belongs to one florist.`,
+        `Your basket already has an item from ${cartItem.product.sellerName}. Remove it before choosing from ${product.sellerName}.`,
       );
       setSelectedProduct(null);
       setCartOpen(true);
       return;
     }
+    const replacedProduct =
+      cartItem && cartItem.product.id !== product.id
+        ? cartItem.product
+        : null;
     setCartItem({ product, plan: activePlan });
     setCartNotice(
-      `${product.name} is in your basket for ${activePlan.method} on ${activePlan.date}. Availability will be checked again at checkout.`,
+      replacedProduct
+        ? `Replaced ${replacedProduct.name} with ${product.name}. This demo basket supports one arrangement per order.`
+        : `Added for ${activePlan.method} on ${activePlan.date}. We’ll recheck availability at checkout.`,
     );
     setSelectedProduct(null);
     setCartOpen(true);
+  }
+
+  async function openProduct(product: Product) {
+    const requestId = ++productDetailRequest.current;
+    setSelectedProduct(product);
+    setProductDetailStatus("loading");
+    const params = new URLSearchParams({
+      date: activePlan.date,
+      method: activePlan.method,
+      postcode: activePlan.postcode,
+    });
+    try {
+      const response = await fetch(
+        `/api/v1/products/${encodeURIComponent(product.slug)}?${params.toString()}`,
+        { cache: "no-store" },
+      );
+      const data = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+      if (!response.ok || !data.product || typeof data.product !== "object") {
+        throw new Error("Product details unavailable");
+      }
+      if (requestId !== productDetailRequest.current) return;
+      const rawDetail = data.product as Record<string, unknown>;
+      const detailAvailability = (rawDetail.availability ?? {}) as Record<string, unknown>;
+      setSelectedProduct({
+        ...product,
+        ...normalizeProduct(rawDetail),
+      });
+      setProductDetailStatus(detailAvailability.bookable === false ? "unavailable" : "ready");
+    } catch {
+      if (requestId === productDetailRequest.current) setProductDetailStatus("error");
+    }
   }
 
   const availableStyles = [
@@ -292,21 +401,35 @@ export function ConsumerMarketplace() {
         <div className="market-hero__copy reveal-block">
           <p className="eyebrow">Independent florists · Singapore</p>
           <h1>
-            Flowers that can <em>actually arrive</em> when you need them.
+            Flowers that <em>arrive when you need them.</em>
           </h1>
           <p className="hero-intro">
-            Search by date and postcode first. We show only arrangements a florist can make,
-            deliver, or have ready for pickup.
+            Choose a date and delivery or pickup. We’ll show only arrangements florists can fulfil.
           </p>
 
           <form
             className="availability-form"
+            aria-busy={isLoading}
             onSubmit={(event) => {
               event.preventDefault();
               void searchCatalogue(draftPlan);
               document.querySelector("#available")?.scrollIntoView({ behavior: "smooth" });
             }}
           >
+            <label className="natural-search">
+              <span>Describe the flowers</span>
+              <input
+                aria-describedby="natural-search-hint"
+                maxLength={180}
+                onChange={(event) => setFlowerQuery(event.target.value)}
+                placeholder="e.g. roses + daisies, anniversary, black wrap"
+                spellCheck
+                type="search"
+                value={flowerQuery}
+              />
+              <small id="natural-search-hint">Typos are okay.</small>
+            </label>
+
             <fieldset className="method-control">
               <legend>How would you like to receive it?</legend>
               <div className="segmented-control">
@@ -329,42 +452,34 @@ export function ConsumerMarketplace() {
               </div>
             </fieldset>
 
-            <div className="availability-fields">
+            <div className={`availability-fields ${method === "pickup" ? "availability-fields--pickup" : ""}`}>
               <label>
                 <span>Date</span>
-                <input type="date" value={date} min={getDefaultDate()} onChange={(e) => setDate(e.target.value)} required />
+                <input type="date" value={date} min={getMinimumDate()} onChange={(e) => setDate(e.target.value)} required />
               </label>
-              <label>
-                <span>{method === "delivery" ? "Delivery postcode" : "Your postcode"}</span>
-                <input
-                  inputMode="numeric"
-                  pattern="[0-9]{6}"
-                  maxLength={6}
-                  value={postcode}
-                  onChange={(e) => setPostcode(e.target.value.replace(/\D/g, ""))}
-                  placeholder="e.g. 168732"
-                  required
-                />
-              </label>
-              <label>
-                <span>Occasion</span>
-                <select value={occasion} onChange={(e) => setOccasion(e.target.value)}>
-                  <option value="birthday">Birthday</option>
-                  <option value="romance">Romance</option>
-                  <option value="congratulations">Congratulations</option>
-                  <option value="thank-you">Thank you</option>
-                  <option value="housewarming">Housewarming</option>
-                </select>
-              </label>
+              {method === "delivery" && (
+                <label>
+                  <span>Delivery postcode</span>
+                  <input
+                    inputMode="numeric"
+                    pattern="[0-9]{6}"
+                    maxLength={6}
+                    value={postcode}
+                    onChange={(e) => setPostcode(e.target.value.replace(/\D/g, ""))}
+                    placeholder="e.g. 168732"
+                    required
+                  />
+                </label>
+              )}
               <button className="primary-button search-button" type="submit" disabled={isLoading}>
-                <span>{isLoading ? "Checking…" : "Find available flowers"}</span>
+                <span>{isLoading ? "Finding matches…" : "Find flowers"}</span>
                 <span className="button-arrow" aria-hidden="true">→</span>
               </button>
             </div>
           </form>
           {hasPendingPlanChanges && (
-            <p className="plan-change-note">
-              Your search controls changed. Results and basket details stay on the last verified plan until you search again.
+            <p className="plan-change-note" role="status">
+              Your plan changed. Search again to refresh availability.
             </p>
           )}
         </div>
@@ -383,10 +498,9 @@ export function ConsumerMarketplace() {
 
       <section className="trust-strip" aria-label="Marketplace commitments">
         <div className="page-shell trust-strip__inner">
-          <span>Availability checked at checkout</span>
-          <span>Prices shown in SGD</span>
-          <span>Seller-managed fulfilment</span>
-          <span>Simulated payment states</span>
+          <span>Availability rechecked</span>
+          <span>Clear SGD totals</span>
+          <span>Demo · no payment taken</span>
         </div>
       </section>
 
@@ -394,12 +508,29 @@ export function ConsumerMarketplace() {
         <div className="section-heading reveal-block">
           <div>
             <p className="eyebrow">Available for your plan</p>
-            <h2>Arrangements with a real path to your door.</h2>
+            <h2>Flowers available for your date.</h2>
           </div>
           <p className="results-context" aria-live="polite">{searchNote}</p>
         </div>
 
         <div className="catalogue-controls" aria-label="Filter available arrangements">
+          <label className="compact-select">
+            <span>Occasion</span>
+            <select value={occasion} onChange={(e) => setOccasion(e.target.value)}>
+              <option value="">Any occasion</option>
+              <option value="birthday">Birthday</option>
+              <option value="anniversary">Anniversary</option>
+              <option value="romance">Romance</option>
+              <option value="congratulations">Congratulations</option>
+              <option value="thank-you">Thank you</option>
+              <option value="get-well">Get well</option>
+              <option value="sympathy">Sympathy</option>
+              <option value="celebration">Celebration</option>
+              <option value="housewarming">Housewarming</option>
+              <option value="new-home">New home</option>
+              <option value="corporate">Corporate</option>
+            </select>
+          </label>
           <label className="compact-select">
             <span>Style</span>
             <select value={style} onChange={(e) => setStyle(e.target.value)}>
@@ -407,7 +538,7 @@ export function ConsumerMarketplace() {
             </select>
           </label>
           <label className="budget-control">
-            <span>Up to {formatSgd(Number(budget) * 100)}</span>
+            <span>Maximum {formatSgd(Number(budget) * 100)}</span>
             <input
               type="range"
               min="70"
@@ -418,8 +549,8 @@ export function ConsumerMarketplace() {
               aria-label={`Maximum budget ${budget} Singapore dollars`}
             />
           </label>
-          <button className="text-button" type="button" onClick={() => void searchCatalogue(draftPlan)} disabled={isLoading}>
-            Apply filters
+          <button className="secondary-button filter-button" type="button" onClick={() => void searchCatalogue(draftPlan)} disabled={isLoading}>
+            {isLoading ? "Updating…" : "Update results"}
           </button>
         </div>
 
@@ -443,27 +574,40 @@ export function ConsumerMarketplace() {
           <div className="product-grid">
             {products.map((product, index) => (
               <article className="product-card reveal-block" style={{ "--item-index": index } as React.CSSProperties} key={product.id}>
-                <button className="product-card__image" type="button" onClick={() => setSelectedProduct(product)} aria-label={`View ${product.name}`}>
+                <div className="product-card__image">
                   <img src={product.imageUrl} alt={product.imageAlt ?? `${product.name} floral arrangement`} />
                   <span className="availability-badge">
-                    {product.capacityRemaining === 1 ? "Last slot" : `${product.capacityRemaining} slots left`}
+                    <span className="availability-badge__full">
+                      {product.capacityRemaining === 1 ? "Last florist slot" : `${product.capacityRemaining} florist slots`}
+                    </span>
+                    <span className="availability-badge__compact">
+                      {product.capacityRemaining === 1 ? "Last slot" : `${product.capacityRemaining} slots`}
+                    </span>
                   </span>
-                </button>
+                </div>
                 <div className="product-card__body">
                   <div className="product-card__seller">
-                    <span>{product.sellerName}</span>
+                    <span className="product-card__seller-name">{product.sellerName}</span>
                     {product.verified && <span className="verified-mark" title="Manually reviewed florist">Verified</span>}
                   </div>
-                  <button className="product-title-button" type="button" onClick={() => setSelectedProduct(product)}>
-                    <span>{product.name}</span>
+                  <div className="product-card__title">
+                    <h3>{product.name}</h3>
                     <strong>{formatSgd(product.priceCents)}</strong>
-                  </button>
-                  <p>{product.description}</p>
-                  <div className="product-card__meta">
-                    <span>{product.style}</span>
-                    <span>{product.sellerArea}</span>
-                    <span>{activePlan.method === "delivery" ? `Delivery ${formatSgd(product.deliveryFeeCents)}` : "Pickup · free"}</span>
                   </div>
+                  <div className="product-card__meta">
+                    <span className="product-card__meta-secondary">{product.style}</span>
+                    <span className="product-card__meta-secondary">{product.sellerArea}</span>
+                    <span className="product-card__meta-fulfilment">{activePlan.method === "delivery" ? `Delivery ${formatSgd(product.deliveryFeeCents)}` : "Pickup · free"}</span>
+                  </div>
+                  <button
+                    aria-label={`View ${product.name} from ${product.sellerName}`}
+                    className="secondary-button product-card__cta"
+                    type="button"
+                    onClick={() => void openProduct(product)}
+                  >
+                    <span className="product-card__cta-full">View arrangement</span>
+                    <span className="product-card__cta-compact">View details</span>
+                  </button>
                 </div>
               </article>
             ))}
@@ -483,12 +627,13 @@ export function ConsumerMarketplace() {
                     ...draftPlan,
                     style: "All styles",
                     budget: "160",
-                    occasion: "birthday",
+                    occasion: "",
                   };
                   setStyle(resetPlan.style);
                   setBudget(resetPlan.budget);
                   setOccasion(resetPlan.occasion);
-                  void searchCatalogue(resetPlan);
+                  setFlowerQuery("");
+                  void searchCatalogue(resetPlan, "");
                 }}
               >
                 Reset optional filters
@@ -503,8 +648,7 @@ export function ConsumerMarketplace() {
           <p className="eyebrow">The florist matters</p>
           <h2>Small studios, chosen with care.</h2>
           <p>
-            Every beta florist is reviewed before going live. Home addresses stay private, and
-            pickup appears only where the seller and platform have approved it.
+            Every beta florist is reviewed. Private home addresses stay protected.
           </p>
         </div>
         <div className="florist-list">
@@ -525,7 +669,7 @@ export function ConsumerMarketplace() {
         <div className="page-shell market-footer__inner">
           <div>
             <Link href="/" className="wordmark wordmark--light">petalfolk<span>.</span></Link>
-            <p>A working closed-beta concept for Singapore’s independent florists.</p>
+            <p>A closed-beta marketplace for Singapore’s independent florists.</p>
           </div>
           <div>
             <span className="footer-label">MVP pathways</span>
@@ -534,7 +678,7 @@ export function ConsumerMarketplace() {
           </div>
           <div>
             <span className="footer-label">Beta note</span>
-            <p>Payments and notifications are simulated. Do not enter real payment details.</p>
+            <p>Payments are simulated. Do not enter real card details.</p>
             <div className="footer-legal"><Link href="/privacy">Privacy notes</Link><Link href="/terms">Beta terms</Link></div>
           </div>
         </div>
@@ -544,8 +688,20 @@ export function ConsumerMarketplace() {
         <ProductDialog
           product={selectedProduct}
           plan={activePlan}
-          onClose={() => setSelectedProduct(null)}
+          detailStatus={productDetailStatus}
+          onClose={() => {
+            productDetailRequest.current += 1;
+            setSelectedProduct(null);
+            setProductDetailStatus("idle");
+          }}
           onAdd={() => addToCart(selectedProduct)}
+          onRetry={() => void openProduct(selectedProduct)}
+          onRefresh={() => {
+            productDetailRequest.current += 1;
+            setSelectedProduct(null);
+            setProductDetailStatus("idle");
+            void searchCatalogue(activePlan, activeFlowerQuery);
+          }}
         />
       )}
 
@@ -554,7 +710,7 @@ export function ConsumerMarketplace() {
           item={cartItem}
           notice={cartNotice}
           onClose={() => setCartOpen(false)}
-          onClear={() => { setCartItem(null); setCartNotice("Your basket is clear."); }}
+          onClear={() => { setCartItem(null); setCartNotice("Basket cleared."); }}
           onCheckout={() => { setCartOpen(false); setCheckoutOpen(true); }}
         />
       )}
@@ -573,8 +729,8 @@ export function ConsumerMarketplace() {
             setOccasion(stalePlan.occasion);
             setCheckoutOpen(false);
             setCartItem(null);
-            setCartNotice("That arrangement’s availability changed, so the basket was cleared and the plan is being refreshed.");
-            void searchCatalogue(stalePlan);
+            setCartNotice("Availability changed, so we cleared your basket and refreshed the results.");
+            void searchCatalogue(stalePlan, activeFlowerQuery);
             const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
             window.requestAnimationFrame(() =>
               document.querySelector("#available")?.scrollIntoView({ behavior: reduceMotion ? "auto" : "smooth" }),
@@ -589,13 +745,19 @@ export function ConsumerMarketplace() {
 function ProductDialog({
   product,
   plan,
+  detailStatus,
   onClose,
   onAdd,
+  onRetry,
+  onRefresh,
 }: {
   product: Product;
   plan: MarketplacePlan;
+  detailStatus: "idle" | "loading" | "ready" | "error" | "unavailable";
   onClose: () => void;
   onAdd: () => void;
+  onRetry: () => void;
+  onRefresh: () => void;
 }) {
   const { method, date } = plan;
   const dialogRef = useRef<HTMLElement>(null);
@@ -605,7 +767,7 @@ function ProductDialog({
       <section ref={dialogRef} tabIndex={-1} className="product-dialog" role="dialog" aria-modal="true" aria-labelledby="product-dialog-title">
         <button className="dialog-close" type="button" onClick={onClose} aria-label="Close product details">×</button>
         <div className="product-dialog__image">
-          <img src={product.imageUrl} alt={`${product.name} arrangement`} />
+          <img src={product.imageUrl} alt={product.imageAlt ?? `${product.name} arrangement`} />
           {product.representativePhoto && <span>Representative seasonal photo</span>}
         </div>
         <div className="product-dialog__content">
@@ -613,12 +775,12 @@ function ProductDialog({
           <h2 id="product-dialog-title">{product.name}</h2>
           <div className="product-dialog__price">
             <strong>{formatSgd(product.priceCents)}</strong>
-            <span>{product.stemCount}</span>
+            {(product.dimensions || product.stemCount) && <span>{product.dimensions || product.stemCount}</span>}
           </div>
           <p className="product-dialog__description">{product.description}</p>
 
           <div className="fulfilment-summary">
-            <span className="fulfilment-summary__label">Your plan</span>
+            <span className="fulfilment-summary__label">Fulfilment</span>
             <div>
               <strong>{method === "delivery" ? "Seller-arranged delivery" : "Self-pickup"}</strong>
               <span>{date} · {product.availableWindows[0]}</span>
@@ -626,28 +788,31 @@ function ProductDialog({
             </div>
           </div>
 
-          <div className="product-detail-grid">
-            <div>
-              <span className="detail-label">Included</span>
-              <ul>{product.includedItems?.map((item) => <li key={item}>{item}</li>)}</ul>
-            </div>
-            <div>
-              <span className="detail-label">Before you order</span>
+          <div className="product-disclosures">
+            <details>
+              <summary>Arrangement details</summary>
               <ul>
+                {product.dimensions && <li>Approximate size: {product.dimensions}</li>}
                 <li>{product.leadTimeHours}-hour minimum lead time</li>
-                <li>Florist confirms within {product.confirmationMinutes ?? 60} minutes</li>
-                <li>Seasonal substitutions need your approval</li>
+                {product.representativePhotoDisclosure && <li>{product.representativePhotoDisclosure}</li>}
+                {product.includedItems?.map((item) => <li key={item}>{item}</li>)}
               </ul>
-            </div>
+            </details>
+            {product.policies && <details>
+              <summary>Ordering policies</summary>
+              <ul>
+                {product.policies.substitution && <li>{product.policies.substitution}</li>}
+                {product.policies.cancellation && <li>{product.policies.cancellation}</li>}
+                {product.policies.freshness && <li>{product.policies.freshness}</li>}
+                {method === "delivery" && product.policies.sellerManagedDelivery && <li>{product.policies.sellerManagedDelivery}</li>}
+              </ul>
+            </details>}
           </div>
 
-          <div className="policy-note">
-            <strong>Freshness and fulfilment</strong>
-            <p>The florist is responsible for the arrangement and seller-managed delivery. Material substitutions are never made silently.</p>
-          </div>
-
-          <button className="primary-button product-dialog__cta" type="button" onClick={onAdd}>
-            <span>Add to basket · {formatSgd(product.priceCents)}</span>
+          {detailStatus === "error" && <p className="form-error" role="alert">Full size and policy details could not be loaded. Try again before ordering.</p>}
+          {detailStatus === "unavailable" && <p className="form-error" role="alert">This florist slot changed while you were browsing. Refresh the results for current options.</p>}
+          <button className="primary-button product-dialog__cta" type="button" onClick={detailStatus === "error" ? onRetry : detailStatus === "unavailable" ? onRefresh : onAdd} disabled={detailStatus === "loading" || detailStatus === "idle"}>
+            <span>{detailStatus === "loading" || detailStatus === "idle" ? "Loading full details…" : detailStatus === "error" ? "Try loading details again" : detailStatus === "unavailable" ? "Refresh available flowers" : `Add to basket · ${formatSgd(product.priceCents)}`}</span>
             <span className="button-arrow" aria-hidden="true">→</span>
           </button>
         </div>
@@ -681,7 +846,7 @@ function CartDrawer({
         <div className="drawer-header">
           <div>
             <p className="eyebrow">One florist per order</p>
-            <h2 id="basket-title">Your basket</h2>
+            <h2 id="basket-title">Basket</h2>
           </div>
           <button className="dialog-close" type="button" onClick={onClose} aria-label="Close basket">×</button>
         </div>
@@ -705,17 +870,18 @@ function CartDrawer({
             <div className="cart-plan">
               <span>{method === "delivery" ? "Delivery" : "Pickup"}</span>
               <strong>{date} · {product.availableWindows[0]}</strong>
+              {method === "pickup" && product.pickupLabel && <small>{product.pickupLabel}</small>}
             </div>
             <button className="primary-button cart-checkout" type="button" onClick={onCheckout}>
               <span>Continue to checkout</span><span className="button-arrow" aria-hidden="true">→</span>
             </button>
-            <p className="checkout-caption">No charge is made now. This demo simulates card authorisation and captures only when the florist accepts.</p>
+            <p className="checkout-caption">Demo only. No payment is taken.</p>
           </>
         ) : (
           <div className="empty-cart">
             <div className="empty-results__shape" aria-hidden="true" />
             <h3>Your basket is waiting.</h3>
-            <p>Choose one arrangement and we will recheck its date, capacity, and fulfilment before placing the order.</p>
+            <p>Choose an arrangement to continue.</p>
             <button className="secondary-button" type="button" onClick={onClose}>Browse available flowers</button>
           </div>
         )}
@@ -742,6 +908,7 @@ function CheckoutDialog({
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [consent, setConsent] = useState(false);
   const formRef = useRef<HTMLFormElement>(null);
+  const consentRef = useRef<HTMLInputElement>(null);
   const requestKey = useRef("");
   const retryStorageKey = `petalfolk:checkout-retry:${product.id}:${method}:${date}:${postcode}`;
   const total = product.priceCents + (method === "delivery" ? product.deliveryFeeCents : 0);
@@ -749,7 +916,8 @@ function CheckoutDialog({
   async function submitOrder(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!consent) {
-      setError("Confirm that you may share the recipient details for this order.");
+      setError("Confirm that you may share the fulfilment contact details for this order.");
+      window.requestAnimationFrame(() => consentRef.current?.focus());
       return;
     }
     setIsSubmitting(true);
@@ -862,15 +1030,17 @@ function CheckoutDialog({
       <section ref={dialogRef} tabIndex={-1} className="checkout-dialog" role="dialog" aria-modal="true" aria-labelledby="checkout-title">
         <button className="dialog-close" type="button" onClick={onClose} aria-label="Close checkout">×</button>
         <div className="checkout-dialog__intro">
-          <p className="eyebrow">Secure demo checkout</p>
-          <h2 id="checkout-title">Who is this arrangement for?</h2>
-          <p>Buyer and recipient details stay separate. No real payment information is collected in this prototype.</p>
+          <p className="eyebrow">Demo checkout</p>
+          <h2 id="checkout-title">{method === "delivery" ? "Delivery details" : "Pickup details"}</h2>
+          <p>Enter the details needed for fulfilment. No real payment is collected.</p>
         </div>
         <form
           ref={formRef}
           onSubmit={submitOrder}
           className="checkout-form"
+          aria-busy={isSubmitting}
           onChange={(event) => {
+            if (error) setError("");
             const target = event.target;
             if (
               !(target instanceof HTMLInputElement) &&
@@ -889,18 +1059,23 @@ function CheckoutDialog({
             <legend>Your details</legend>
             <div className="form-grid">
               <label><span>Your name</span><input name="buyerName" autoComplete="name" defaultValue="Jamie Lim" required aria-invalid={Boolean(fieldErrors.buyerName)} aria-describedby={fieldErrors.buyerName ? "buyerName-error" : undefined} />{fieldErrors.buyerName && <small className="field-error" id="buyerName-error">{fieldErrors.buyerName}</small>}</label>
-              <label><span>Email for order access</span><input name="buyerEmail" type="email" autoComplete="email" defaultValue="jamie@example.com" required aria-invalid={Boolean(fieldErrors.buyerEmail)} aria-describedby={fieldErrors.buyerEmail ? "buyerEmail-error" : undefined} />{fieldErrors.buyerEmail && <small className="field-error" id="buyerEmail-error">{fieldErrors.buyerEmail}</small>}</label>
+              <label><span>Email</span><input name="buyerEmail" type="email" autoComplete="email" defaultValue="jamie@example.com" required aria-invalid={Boolean(fieldErrors.buyerEmail)} aria-describedby={fieldErrors.buyerEmail ? "buyerEmail-error" : undefined} />{fieldErrors.buyerEmail && <small className="field-error" id="buyerEmail-error">{fieldErrors.buyerEmail}</small>}</label>
             </div>
           </fieldset>
           <fieldset>
-            <legend>Recipient</legend>
+            <legend>{method === "delivery" ? "Recipient" : "Collector"}</legend>
             <div className="form-grid">
-              <label><span>Recipient name</span><input name="recipientName" autoComplete="off" defaultValue="Alicia Tan" required aria-invalid={Boolean(fieldErrors.recipientName)} aria-describedby={fieldErrors.recipientName ? "recipientName-error" : undefined} />{fieldErrors.recipientName && <small className="field-error" id="recipientName-error">{fieldErrors.recipientName}</small>}</label>
-              <label><span>Recipient phone</span><input name="recipientPhone" type="tel" inputMode="tel" defaultValue="9123 4821" required aria-invalid={Boolean(fieldErrors.recipientPhone)} aria-describedby={fieldErrors.recipientPhone ? "recipientPhone-error" : undefined} />{fieldErrors.recipientPhone && <small className="field-error" id="recipientPhone-error">{fieldErrors.recipientPhone}</small>}</label>
+              <label><span>{method === "delivery" ? "Recipient name" : "Collector name"}</span><input name="recipientName" autoComplete="off" defaultValue="Alicia Tan" required aria-invalid={Boolean(fieldErrors.recipientName)} aria-describedby={fieldErrors.recipientName ? "recipientName-error" : undefined} />{fieldErrors.recipientName && <small className="field-error" id="recipientName-error">{fieldErrors.recipientName}</small>}</label>
+              <label><span>{method === "delivery" ? "Recipient phone" : "Collector phone"}</span><input name="recipientPhone" type="tel" inputMode="tel" defaultValue="9123 4821" required aria-invalid={Boolean(fieldErrors.recipientPhone)} aria-describedby={fieldErrors.recipientPhone ? "recipientPhone-error" : undefined} />{fieldErrors.recipientPhone && <small className="field-error" id="recipientPhone-error">{fieldErrors.recipientPhone}</small>}</label>
               {method === "delivery" && (
                 <>
                   <label className="form-grid__wide"><span>Delivery address</span><input name="addressLine" autoComplete="street-address" defaultValue="20 Tiong Bahru Road" required aria-invalid={Boolean(fieldErrors.addressLine)} aria-describedby={fieldErrors.addressLine ? "addressLine-error" : undefined} />{fieldErrors.addressLine && <small className="field-error" id="addressLine-error">{fieldErrors.addressLine}</small>}</label>
-                  <label><span>Postal code</span><input name="postcode" inputMode="numeric" pattern="[0-9]{6}" defaultValue={postcode} required aria-invalid={Boolean(fieldErrors.postcode)} aria-describedby={fieldErrors.postcode ? "postcode-error" : undefined} />{fieldErrors.postcode && <small className="field-error" id="postcode-error">{fieldErrors.postcode}</small>}</label>
+                  <label>
+                    <span>Verified postal code</span>
+                    <input name="postcode" inputMode="numeric" pattern="[0-9]{6}" value={postcode} readOnly required aria-invalid={Boolean(fieldErrors.postcode)} aria-describedby={fieldErrors.postcode ? "postcode-error postcode-hint" : "postcode-hint"} />
+                    <small className="field-hint" id="postcode-hint">From your availability search. Close checkout to change it.</small>
+                    {fieldErrors.postcode && <small className="field-error" id="postcode-error">{fieldErrors.postcode}</small>}
+                  </label>
                   <label className="form-grid__wide"><span>Delivery instructions <small>(optional)</small></span><textarea name="deliveryInstructions" rows={2} maxLength={500} placeholder="For example: call the recipient on arrival" aria-invalid={Boolean(fieldErrors.deliveryInstructions)} aria-describedby={fieldErrors.deliveryInstructions ? "deliveryInstructions-error" : undefined} />{fieldErrors.deliveryInstructions && <small className="field-error" id="deliveryInstructions-error">{fieldErrors.deliveryInstructions}</small>}</label>
                 </>
               )}
@@ -915,14 +1090,13 @@ function CheckoutDialog({
           <fieldset>
             <legend>Gift details</legend>
             <div className="form-grid">
-              <label className="form-grid__wide"><span>Message card</span><textarea name="cardMessage" rows={3} defaultValue="Thinking of you today. — Jamie" maxLength={240} aria-invalid={Boolean(fieldErrors.cardMessage)} aria-describedby={fieldErrors.cardMessage ? "cardMessage-error" : undefined} />{fieldErrors.cardMessage && <small className="field-error" id="cardMessage-error">{fieldErrors.cardMessage}</small>}</label>
-              <p className="form-grid__wide policy-note">If a flower becomes unavailable, the florist must ask before making any material substitution.</p>
+              <label className="form-grid__wide"><span>Message card <small>(optional)</small></span><textarea name="cardMessage" rows={3} placeholder="Write a short note" maxLength={240} aria-invalid={Boolean(fieldErrors.cardMessage)} aria-describedby={fieldErrors.cardMessage ? "cardMessage-error" : undefined} />{fieldErrors.cardMessage && <small className="field-error" id="cardMessage-error">{fieldErrors.cardMessage}</small>}</label>
             </div>
           </fieldset>
 
           <label className="consent-check">
-            <input type="checkbox" checked={consent} onChange={(e) => setConsent(e.target.checked)} />
-            <span>I am authorised to provide these recipient details for fulfilment of this order.</span>
+            <input ref={consentRef} type="checkbox" checked={consent} onChange={(e) => { setConsent(e.target.checked); setError(""); }} />
+            <span>I may share these fulfilment contact details for this order.</span>
           </label>
 
           {error && <p className="form-error" role="alert">{error}</p>}
@@ -931,14 +1105,15 @@ function CheckoutDialog({
             <div>
               <span>{product.name} · {product.sellerName}</span>
               <strong>{method === "delivery" ? "Delivery" : "Pickup"} on {date}</strong>
+              {method === "pickup" && product.pickupLabel && <small>{product.pickupLabel}</small>}
             </div>
             <div><span>Final total</span><strong>{formatSgd(total)}</strong></div>
           </div>
           <button className="primary-button checkout-submit" type="submit" disabled={isSubmitting}>
-            <span>{isSubmitting ? "Reserving florist capacity…" : `Authorise ${formatSgd(total)} & request order`}</span>
+            <span aria-live="polite">{isSubmitting ? "Requesting order…" : `Request order · ${formatSgd(total)}`}</span>
             <span className="button-arrow" aria-hidden="true">→</span>
           </button>
-          <p className="checkout-caption">The florist has {product.confirmationMinutes ?? 60} minutes to accept. The simulated authorisation is captured only on acceptance and voided if declined.</p>
+          <p className="checkout-caption">The florist has {product.confirmationMinutes ?? 60} minutes to confirm. No charge is taken if they decline.</p>
         </form>
       </section>
     </div>

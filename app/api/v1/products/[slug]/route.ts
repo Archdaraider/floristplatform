@@ -1,6 +1,6 @@
 import { errorResponse, jsonBody } from "@/lib/api";
 import { parseCatalogContext, productDetail } from "@/lib/availability";
-import { updateProductStatus } from "@/lib/seller";
+import { MAIN_DEMO_SELLER_ID, updateProductStatus } from "@/lib/seller";
 
 interface RouteContext {
   params: Promise<{ slug: string }>;
@@ -22,10 +22,12 @@ export async function GET(request: Request, context: RouteContext) {
 export async function PATCH(request: Request, context: RouteContext) {
   try {
     const { slug: id } = await context.params;
+    const sellerId =
+      new URL(request.url).searchParams.get("sellerId") || MAIN_DEMO_SELLER_ID;
     const input = await jsonBody<{ status?: "published" | "paused"; published?: boolean }>(
       request
     );
-    return Response.json(await updateProductStatus(id, input));
+    return Response.json(await updateProductStatus(id, input, sellerId));
   } catch (error) {
     return errorResponse(error, request);
   }

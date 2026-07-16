@@ -10,6 +10,10 @@ const { d1, r2 } = hostingConfig;
 
 // macOS Seatbelt blocks FSEvents, so Codex previews need polling for HMR.
 const isCodexSeatbeltSandbox = process.env.CODEX_SANDBOX === "seatbelt";
+const enableWorkersAi =
+  process.env.PETALFOLK_ENABLE_WORKERS_AI === "true" ||
+  (process.env.PETALFOLK_ENABLE_WORKERS_AI !== "false" &&
+    process.env.npm_lifecycle_event === "build");
 
 const localBindingConfig = {
   main: "./worker/index.ts",
@@ -31,6 +35,7 @@ const localBindingConfig = {
         },
       ]
     : [],
+  ...(enableWorkersAi ? { ai: { binding: "AI", remote: true } } : {}),
 };
 
 export default defineConfig(async () => {

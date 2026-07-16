@@ -12,6 +12,16 @@ function singaporeDateFromNow(days) {
   }).format(date);
 }
 
+function singaporeOrderNumberPrefix(date = new Date()) {
+  const dateLocal = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Singapore",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(date);
+  return `FL-${dateLocal.slice(2).replaceAll("-", "")}-`;
+}
+
 async function request(path, init = {}) {
   const response = await fetch(`${baseUrl}${path}`, init);
   const payload = await response.json();
@@ -92,6 +102,7 @@ const created = await request("/api/v1/orders", {
 });
 assert.equal(created.order.commercialStatus, "awaiting_seller");
 assert.equal(created.order.paymentStatus, "authorised");
+assert.ok(created.order.orderNumber.startsWith(singaporeOrderNumberPrefix()));
 
 const retried = await request("/api/v1/orders", {
   method: "POST",
@@ -101,8 +112,11 @@ const retried = await request("/api/v1/orders", {
 assert.equal(retried.order.id, created.order.id, "checkout retry must be idempotent");
 
 const orderId = created.order.id;
+const deliverySellerQuery = new URLSearchParams({
+  sellerId: created.order.seller.id,
+}).toString();
 const transition = async (action) =>
-  request(`/api/v1/orders/${orderId}`, {
+  request(`/api/v1/seller/orders/${orderId}?${deliverySellerQuery}`, {
     method: "PATCH",
     headers: { ...jsonHeaders, "Idempotency-Key": `smoke-${orderId}-${action}` },
     body: JSON.stringify({ action }),
@@ -121,6 +135,30 @@ assert.equal(completed.order.commercialStatus, "completed");
 assert.equal(completed.order.operationalStatus, "fulfilled");
 assert.ok(completed.events.length >= 6, "material order actions should be append-only events");
 
+const initialSellerNote = await request(`/api/v1/seller/orders/${orderId}/note`);
+const sellerNoteMarker = `SMOKE_SELLER_NOTE_${Date.now()}`;
+const savedSellerNote = await request(`/api/v1/seller/orders/${orderId}/note`, {
+  method: "PUT",
+  headers: jsonHeaders,
+  body: JSON.stringify({
+    body: `${sellerNoteMarker}\nCourier handoff confirmed.`,
+    expectedVersion: initialSellerNote.note.version,
+  }),
+});
+const reloadedSellerNote = await request(`/api/v1/seller/orders/${orderId}/note`);
+assert.equal(reloadedSellerNote.note.body, savedSellerNote.note.body);
+assert.equal(reloadedSellerNote.note.version, savedSellerNote.note.version);
+const buyerSafeOrder = await request(`/api/v1/orders/${orderId}`);
+assert.ok(
+  !JSON.stringify(buyerSafeOrder).includes(sellerNoteMarker),
+  "private seller notes must stay out of the buyer order bundle",
+);
+await request(`/api/v1/seller/orders/${orderId}/note`, {
+  method: "PUT",
+  headers: jsonHeaders,
+  body: JSON.stringify({ body: "", expectedVersion: reloadedSellerNote.note.version }),
+});
+
 const message = await request(`/api/v1/orders/${orderId}/messages`, {
   method: "POST",
   headers: { ...jsonHeaders, "Idempotency-Key": `smoke-${orderId}-message` },
@@ -132,8 +170,17 @@ const message = await request(`/api/v1/orders/${orderId}/messages`, {
 });
 assert.equal(message.demoMode, true);
 
+const declineResult = await findBookableProduct({
+  method: "delivery",
+  budget: 160,
+  postcode: "160042",
+  sellerId: dashboard.seller.id,
+});
 const declineInput = {
   ...orderInput,
+  productId: declineResult.product.id,
+  requestedDate: declineResult.date,
+  window: declineResult.product.availability.window,
   buyer: { name: "Morgan Lee", email: "morgan@example.com" },
 };
 const declineCreated = await request("/api/v1/orders", {
@@ -144,7 +191,11 @@ const declineCreated = await request("/api/v1/orders", {
   },
   body: JSON.stringify(declineInput),
 });
-const declined = await request(`/api/v1/orders/${declineCreated.order.id}`, {
+assert.ok(declineCreated.order.orderNumber.startsWith(singaporeOrderNumberPrefix()));
+const declineSellerQuery = new URLSearchParams({
+  sellerId: declineCreated.order.seller.id,
+}).toString();
+const declined = await request(`/api/v1/seller/orders/${declineCreated.order.id}?${declineSellerQuery}`, {
   method: "PATCH",
   headers: {
     ...jsonHeaders,
@@ -181,9 +232,34 @@ const pickupCreated = await request("/api/v1/orders", {
     recipient: { name: "Jamie Lim", phone: "91234821" },
   }),
 });
+const pickupSellerId = pickupResult.product.seller.id;
+assert.notEqual(
+  pickupSellerId,
+  dashboard.seller.id,
+  "pickup fixture should exercise a different seller workspace",
+);
+assert.ok(pickupCreated.order.orderNumber.startsWith(singaporeOrderNumberPrefix()));
+assert.equal(pickupCreated.order.pickupLocation, pickupResult.product.seller.publicAddress);
+
+const pickupSellerQuery = new URLSearchParams({ sellerId: pickupSellerId }).toString();
+const pickupSellerDashboard = await request(`/api/v1/seller/dashboard?${pickupSellerQuery}`);
+assert.equal(pickupSellerDashboard.seller.id, pickupSellerId);
+const queuedPickup = pickupSellerDashboard.orders.find(
+  (item) => item.id === pickupCreated.order.id,
+);
+assert.ok(queuedPickup, "pickup order must appear in its fulfilling seller dashboard");
+assert.equal(queuedPickup.operationalStatus, "awaiting_acceptance");
+const unrelatedSellerQuery = new URLSearchParams({ sellerId: dashboard.seller.id }).toString();
+const unrelatedSellerDashboard = await request(
+  `/api/v1/seller/dashboard?${unrelatedSellerQuery}`,
+);
+assert.ok(
+  !unrelatedSellerDashboard.orders.some((item) => item.id === pickupCreated.order.id),
+  "pickup order must not appear in an unrelated seller dashboard",
+);
 
 const pickupTransition = async (action) =>
-  request(`/api/v1/orders/${pickupCreated.order.id}`, {
+  request(`/api/v1/seller/orders/${pickupCreated.order.id}?${pickupSellerQuery}`, {
     method: "PATCH",
     headers: {
       ...jsonHeaders,
@@ -194,10 +270,15 @@ const pickupTransition = async (action) =>
 
 for (const action of ["accept", "preparing", "ready", "fulfilled"]) {
   await pickupTransition(action);
+  const sellerSnapshot = await request(`/api/v1/seller/dashboard?${pickupSellerQuery}`);
+  const visibleOrder = sellerSnapshot.orders.find((item) => item.id === pickupCreated.order.id);
+  assert.ok(visibleOrder, `pickup order must remain visible after ${action}`);
+  assert.equal(visibleOrder.operationalStatus, action === "accept" ? "accepted" : action);
 }
 const pickupCompleted = await request(`/api/v1/orders/${pickupCreated.order.id}`);
 assert.equal(pickupCompleted.order.fulfilmentMethod, "pickup");
 assert.equal(pickupCompleted.order.operationalStatus, "fulfilled");
+assert.equal(pickupCompleted.order.pickupLocation, pickupResult.product.seller.publicAddress);
 
 console.log(
   JSON.stringify(
@@ -210,6 +291,8 @@ console.log(
       eventCount: completed.events.length,
       pathwayChecks: "delivery and pickup fulfilled; decline voided",
       privacyCheck: "home address absent; approved pickup location present",
+      pickupSellerId,
+      pickupSellerWorkspace: `/seller?sellerId=${encodeURIComponent(pickupSellerId)}&orderId=${encodeURIComponent(pickupCreated.order.id)}`,
     },
     null,
     2,

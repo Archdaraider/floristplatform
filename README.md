@@ -25,7 +25,7 @@ Open the local URL printed by the development server, normally `http://localhost
 The primary pathways are:
 
 - Consumer marketplace: `/`
-- Seller studio: `/seller`
+- Seller studio: `/seller` (tracking links add the correct demo `sellerId` and `orderId`)
 - Marketplace operations: `/admin`
 - Buyer order tracking: `/order/:id` after checkout
 
@@ -34,15 +34,15 @@ The application is also configured as an installable PWA with a manifest, servic
 ## Recommended demo
 
 1. Open the consumer marketplace.
-2. Search delivery using the prefilled Singapore postcode and a future date.
+2. Try `Roses + daiseis fr anniversary black wrapper`, then search delivery using the prefilled Singapore postcode and a future date.
 3. Open an arrangement, review fulfilment and substitution context, and add it to the basket.
 4. Complete the demo checkout. The app revalidates availability, reserves capacity, creates an immutable order snapshot, and simulates payment authorisation.
-5. From the tracking page, open the seller pathway.
+5. From the tracking page, open that order’s florist pathway. Delivery and pickup orders now select their owning demo seller automatically.
 6. Select the newest request and choose **Accept & capture payment**.
 7. Continue through preparation, ready, courier, delivered, and fulfilment actions.
 8. Return to the buyer order URL to see the updated simplified status and append-only timeline.
 9. Use the order thread to send a labelled buyer message.
-10. In the seller studio, verify the destination, delivery instructions, and shared conversation before fulfilment.
+10. In the seller studio, verify the destination and delivery instructions, save a private working note, and review the shared conversation before fulfilment.
 11. Open `/admin` to see seller review, exception, financial-boundary, and audit-timeline projections.
 
 The black preview bar at the top of every main screen switches between consumer, seller, and operations pathways.
@@ -51,7 +51,8 @@ The black preview bar at the top of every main screen switches between consumer,
 
 ### Consumer pathway
 
-- Required search context: date, delivery or pickup, and postcode
+- Required search context: date and delivery or pickup, plus postcode only for delivery
+- Natural-language flower search with typo correction, validated flower/occasion/style/wrapping facets, exact-versus-closest labels, and a deterministic no-AI fallback
 - Optional occasion, style, and budget filters
 - One canonical availability calculation used by catalogue, product detail, and checkout
 - Postal-sector serviceability, seller/product state, lead time, daily capacity, method, and price checks
@@ -70,12 +71,15 @@ The black preview bar at the top of every main screen switches between consumer,
 ### Seller pathway
 
 - Deadline-sorted action queue rather than a generic order table
-- New-request, active-order, capacity, and payout signals
+- New-request, active-order, capacity, and unread-message signals
+- Per-order unread counts that clear only through the latest buyer message visibly opened by the seller
 - Guarded delivery and pickup state transitions
 - Accept, decline, prepare, ready, courier, deliver, and fulfil actions
 - Idempotent seller transitions and simulated payment/payout side effects
 - Order detail with separate buyer, recipient, gift-message, and fulfilment context
+- Dynamic demo seller workspaces, including approved public pickup locations and order-specific handoff links
 - Authorised delivery destination, delivery instructions, and a two-way order conversation in the seller workspace
+- Private per-order seller notes with explicit save, persisted drafts, and stale-edit protection; note content is excluded from buyer order and tracking payloads
 - Catalogue publish/pause controls that do not mutate historical order snapshots
 - Seller intake pause/resume that preserves confirmed obligations
 - Seven-day capacity projection and represented fulfilment configuration
@@ -93,7 +97,7 @@ The black preview bar at the top of every main screen switches between consumer,
 
 - Responsive React/TypeScript UI for mobile, tablet, and desktop
 - Warm editorial design system using Geist, Geist Mono, and Instrument Serif
-- Keyboard focus states, trapped/restored modal focus, Escape handling, background inerting, scroll lock, skip navigation, semantic landmarks, 44px touch targets, reduced-motion support, loading/empty/error states, and non-colour status labels
+- Keyboard focus states, trapped/restored modal focus, Escape handling, background inerting, scroll lock, skip navigation, semantic landmarks, 48px mobile touch targets, reduced-motion support, loading/empty/error states, and non-colour status labels
 - Versioned `/api/v1` routes
 - D1/SQLite persistence with Drizzle schema and generated migration
 - Capacity constraints, order-scoped command idempotency, payload-conflict detection, and append-only order events/messages
@@ -120,6 +124,7 @@ Buyer / Seller / Operations UI
 The current implementation uses the Sites-compatible vinext runtime (React 19, Next-compatible app routing, TypeScript, Tailwind CSS 4, Cloudflare D1, and Drizzle). Business logic lives outside page components:
 
 - `lib/availability.ts` — canonical search and checkout eligibility
+- `lib/smart-search.ts` — safe natural-language intent extraction, typo-tolerant local matching, optional Workers AI/Groq enrichment, and bookable-product ranking
 - `lib/orders.ts` — order creation, state guards, idempotency, payment simulation, events, and messages
 - `lib/seller.ts` — seller dashboard, catalogue state, capacity, and intake settings
 - `lib/admin.ts` — review, exception, financial, and audit projections
@@ -128,6 +133,8 @@ The current implementation uses the Sites-compatible vinext runtime (React 19, N
 - `drizzle/` — generated SQL migration
 
 The D1 binding is declared logically as `DB` in `.openai/hosting.json`. Local development keeps data in project-local Wrangler state. The seed routine is idempotent, so restarting the development server preserves demo changes rather than duplicating records.
+
+Production builds declare a Cloudflare Workers AI binding for ambiguous, multi-constraint searches. Common flower and occasion requests are resolved locally first, and every model response is restricted to the catalogue taxonomy. The search never gives an LLM SQL access and never sends buyer, recipient, postcode, or order data. To test Workers AI locally, first authenticate Wrangler (`wrangler login` or `CLOUDFLARE_API_TOKEN`), then set `PETALFOLK_ENABLE_WORKERS_AI=true`; otherwise the zero-cost local parser remains active. A server-side `GROQ_API_KEY` is supported as an optional high-throughput fallback. Current operating-cost and throughput assumptions are documented in [`expenditures.md`](expenditures.md).
 
 ## Three deep-dive improvements
 
@@ -141,14 +148,18 @@ The July 2026 regression pass consolidated the fixes into three project-level im
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/v1/catalog` | Availability-aware catalogue search |
+| `GET` | `/api/v1/catalog` | Availability-aware catalogue and typo-tolerant `q` smart search |
 | `GET` | `/api/v1/products/:slug` | Product detail using the same availability context |
-| `PATCH` | `/api/v1/products/:id` | Main demo seller publish/pause command |
+| `PATCH` | `/api/v1/products/:id?sellerId=…` | Selected demo seller publish/pause command |
 | `POST` | `/api/v1/orders` | Revalidate, reserve capacity, authorise, and create an order |
 | `GET` | `/api/v1/orders/:id` | Buyer-safe order, events, and messages |
-| `PATCH` | `/api/v1/orders/:id` | Guarded seller order transition |
-| `POST` | `/api/v1/orders/:id/messages` | Labelled order-scoped message |
+| `POST` | `/api/v1/orders/:id/messages` | Buyer order message with server-derived identity |
 | `GET` | `/api/v1/seller/dashboard` | Seller action queue, products, capacity, and metrics |
+| `GET` / `PATCH` | `/api/v1/seller/orders/:id?sellerId=…` | Ownership-checked seller order detail and transition |
+| `POST` | `/api/v1/seller/orders/:id/messages?sellerId=…` | Ownership-checked seller reply with server-derived identity |
+| `POST` | `/api/v1/seller/orders/:id/messages/read?sellerId=…` | Clear buyer messages through the latest visibly opened message |
+| `GET` | `/api/v1/seller/orders/:id/note?sellerId=…` | Load the selected demo seller’s private per-order note |
+| `PUT` | `/api/v1/seller/orders/:id/note` | Replace a private note using its expected version |
 | `PATCH` | `/api/v1/seller/settings` | Pause or resume new intake |
 | `GET` | `/api/v1/admin/dashboard` | Seller review, exception, financial, and audit projection |
 
@@ -179,11 +190,12 @@ The smoke test proves:
 - order retries return the same order;
 - acceptance captures the simulated authorisation once;
 - decline voids the simulated authorisation and releases reserved capacity;
-- guarded delivery and pickup states reach completion;
+- guarded delivery and pickup states reach completion and each order appears in its owning seller dashboard;
 - material actions create an append-only event trail; and
-- order-scoped messaging persists.
+- order-scoped messaging persists; and
+- a private seller note saves and reloads without entering the buyer order bundle.
 
-`npm test` also runs eight rendered-route and API guardrail checks, including malformed JSON returning `422`, cross-order idempotency isolation, concurrent exact-retry serialization, changed-payload conflicts, tampered-window rejection, plan-snapshot source guards, keyboard-dialog guards, and private-route service-worker exclusions.
+`npm test` also runs rendered-route and API guardrail checks, including typo-heavy smart search, malformed JSON returning `422`, cross-order idempotency isolation, concurrent exact-retry serialization, seller-note privacy and optimistic concurrency, changed-payload conflicts, tampered-window rejection, plan-snapshot source guards, keyboard-dialog guards, and private-route service-worker exclusions.
 
 Generate a migration after changing `db/schema.ts`:
 
@@ -208,7 +220,7 @@ Do not use this build for real buyers, sellers, payments, or recipient data. The
 - Production observability, rate limits, CSP/cookie hardening, secret scanning, backups, restore drills, and incident runbooks
 - Concurrency, authorization, accessibility, responsive-browser, load, and security penetration suites required by the PRD
 
-The complete gap analysis and recommended build sequence are documented in [`docs/MVP_SCOPE_AND_ROADMAP.md`](docs/MVP_SCOPE_AND_ROADMAP.md).
+The complete gap analysis and recommended build sequence are documented in [`docs/MVP_SCOPE_AND_ROADMAP.md`](docs/MVP_SCOPE_AND_ROADMAP.md). The research-backed mobile rules and acceptance checks are in [`docs/MOBILE_UX_STANDARD.md`](docs/MOBILE_UX_STANDARD.md).
 
 ## How to proceed from here
 
