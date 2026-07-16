@@ -763,6 +763,11 @@ test("finished source has product metadata and interaction guardrails", async ()
     css.indexOf("@media (max-width: 768px)"),
     css.indexOf("@media (max-width: 480px)"),
   );
+  assert.match(css, /\.product-grid\s*\{[\s\S]*?grid-auto-rows:\s*1fr/);
+  assert.match(css, /\.product-card\s*\{[\s\S]*?height:\s*100%[\s\S]*?grid-template-rows:\s*auto minmax\(0,\s*1fr\)/);
+  assert.match(css, /\.product-card__body\s*\{[\s\S]*?grid-template-rows:\s*auto auto minmax\(min-content,\s*1fr\) auto/);
+  assert.match(css, /\.florist-list\s*\{[\s\S]*?grid-auto-rows:\s*minmax\(112px,\s*1fr\)/);
+  assert.doesNotMatch(css, /margin-top:\s*72px/);
   assert.match(mobileCatalogueCss, /\.product-grid\s*\{\s*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)/);
   assert.match(mobileCatalogueCss, /\.product-card__cta\s*\{[\s\S]*?min-height:\s*48px/);
   assert.match(consumer, /product-card__cta-compact/);
