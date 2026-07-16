@@ -17,6 +17,15 @@ The selected hosted model is Cloudflare's `@cf/meta/llama-3.1-8b-instruct-fast`.
 
 Cloudflare Workers AI has a default **300 text-generation requests per minute**, so it does not have the 10-RPM problem. Common searches do not consume that allowance because they resolve locally. Cloudflare accepts custom-limit requests if the production peak later exceeds 300 RPM. See [Workers AI limits](https://developers.cloudflare.com/workers-ai/platform/limits/).
 
+### Current private-preview status
+
+The deployed ChatGPT Sites preview was checked after release and currently reports the `local` engine for the example search. That means it is serving the typo-tolerant, taxonomy-aware search at zero model cost, but it is **not yet consuming hosted LLM inference**. LLM enrichment becomes active when either:
+
+- the same build is deployed to a Cloudflare Worker with its `AI` binding attached; or
+- a paid Groq Developer key is stored server-side as `GROQ_API_KEY` and the site is redeployed.
+
+Never put either credential in Git or browser code. Until provider analytics and the API response report `workers-ai` or `groq`, budget the preview as deterministic smart search rather than paid LLM search. This fallback is intentional: it preserves availability and handles the supplied typo-heavy example even when no model provider is configured.
+
 ## Hosted model cost per request
 
 The estimates below assume a deliberately small intent-extraction call:
